@@ -1,0 +1,36 @@
+# Data Policy Compliance Agent - Technology Stack
+
+## Current Stack & Reasoning
+
+1. **Frontend / UI: Streamlit**
+   * **Why we used it:** Streamlit is the absolute fastest way to build a functional, interactive web app for Python-based data and AI projects. It allows us to build a complex "Human-in-the-Loop" UI (document upload, streaming LLM thoughts, editable SQL text areas, and data tables) in under 150 lines of pure Python, without needing to write any HTML/CSS/React.
+   * **Alternatives:** 
+     * *Gradio:* Also great for AI demos, but slightly less flexible for complex state management (like our editable SQL step).
+     * *Next.js (React) + FastAPI:* The production-grade choice. It gives you 100% control over the UI (crucial for a real enterprise compliance tool) but takes significantly longer to build from scratch.
+
+2. **Database / Execution Engine: DuckDB**
+   * **Why we used it:** DuckDB is an in-process SQL OLAP database. It is incredibly fast for analytical queries over tabular data (like our mock CSVs) and runs entirely in memory without requiring a separate database server. It is the perfect engine for local, fast verification of generated SQL.
+   * **Alternatives:**
+     * *SQLite:* Great for transactional (OLTP) apps, but DuckDB is vastly superior for the analytical, aggregative queries (OLAP) common in compliance rules.
+     * *PostgreSQL / Snowflake / BigQuery:* The production choices. In a real-world deployed app, Agent 2 would generate SQL dialect specific to whatever massive data warehouse the company uses.
+
+3. **LLM Orchestration: Google GenAI SDK (Gemini 2.5 Flash) + Pydantic**
+   * **Why we used it:** 
+     * *Gemini 2.5 Flash:* Offers an excellent balance of high reasoning capability (needed for SQL generation), massive context window (for reading long PDF policies), and very low latency (crucial for a snappy UI).
+     * *Pydantic (Structured Outputs):* We force the LLM to reply in strict JSON schemas defined by Pydantic models (`AbstractRule`, `SQLMapping`). This replaces unreliable "prompt engineering" with deterministic code contracts, ensuring the app never crashes because the LLM forgot to output a specific field.
+   * **Alternatives:**
+     * *LangChain / LlamaIndex:* Popular orchestration frameworks. However, they can often be overly complex and add unnecessary abstractions. Writing raw API calls with Pydantic is often cleaner and easier to debug for specific agentic workflows.
+     * *OpenAI GPT-4o / Anthropic Claude 3.5 Sonnet:* Viable alternative frontier models that also support structured JSON outputs.
+
+4. **PDF Parsing: PyPDF2**
+   * **Why we used it:** A simple, lightweight library to rip text from basic PDF documents.
+   * **Alternatives:**
+     * *Unstructured.io / LlamaParse:* If the compliance policies had complex tables, charts, or weird multi-column layouts, these advanced parsing libraries (or using a multimodal LLM to "read" the pages directly) would be necessary for high-fidelity extraction.
+
+## The Architecture Pattern
+We are using a **Multi-Agent Pipeline with a Human-in-the-Loop (HITL)**.
+* **Agent 1 (Policy Extractor):** Focuses solely on logic extraction.
+* **Agent 2 (Database Mapper):** Focuses solely on translating logic to a specific SQL dialect based on a provided schema.
+* **Agent 3 (Forensic Auditor):** Focuses on explaining the results to non-technical users.
+
+This modular separation of concerns makes the system much more robust than asking one LLM prompt to do everything at once.

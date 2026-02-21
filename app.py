@@ -1,122 +1,231 @@
 import streamlit as st
-import json
-import datetime
+import pandas as pd
 import PyPDF2
+from io import StringIO
+import markdown
+from xhtml2pdf import pisa
+from io import BytesIO
 
-from engine import DatabaseEngine
 from llm_pipeline import LLMPipeline
+from executor import PandasExecutor
+from utils import extract_text_from_file
 
-# --- Setup State & Engine ---
-if "engine" not in st.session_state:
-    st.session_state.engine = DatabaseEngine()
+# --- State Management ---
 if "pipeline" not in st.session_state:
-    st.session_state.pipeline = LLMPipeline(st.session_state.engine.get_schema_map())
-if "rules" not in st.session_state:
-    st.session_state.rules = []
-if "audit_log" not in st.session_state:
-    st.session_state.audit_log = []
+    st.session_state.pipeline = LLMPipeline()
 
-# --- Helper Functions ---
-def extract_text_from_file(uploaded_file) -> str:
-    if uploaded_file.name.endswith('.pdf'):
-        pdf_reader = PyPDF2.PdfReader(uploaded_file)
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text() + "\n"
-        return text
-    else:
-        # Fallback for plain text files (.txt)
-        return uploaded_file.getvalue().decode("utf-8")
+if "agent_1_rules" not in st.session_state:
+    st.session_state.agent_1_rules = []
 
-def parse_policy(text: str):
-    with st.spinner("Agent 1 is analyzing the PDF and writing queries..."):
-        try:
-            extraction = st.session_state.pipeline.agent_1_extract_and_query(text)
-            st.session_state.rules = [rule.model_dump() for rule in extraction.rules]
-            st.success("Extraction complete!")
-        except Exception as e:
-            st.error(f"Failed to extract rules: {e}")
+if "agent_2_mapped_rules" not in st.session_state:
+    st.session_state.agent_2_mapped_rules = []
+    
+if "final_report" not in st.session_state:
+    st.session_state.final_report = ""
 
-def run_query(rule_index, sql_query, rule_description):
-    with st.spinner("Agent 2 is scanning the database..."):
-        result = st.session_state.engine.execute_query(sql_query)
-        if not result["success"]:
-            st.error(f"SQL Error: {result['error']}")
-            return
-        
-        if result["count"] == 0:
-            st.info("No violations found for this rule.")
-            return
-
-        st.warning(f"Found {result['count']} suspicious records!")
-        
-        # Display the first flagged record for Agent 2 to explain
-        first_record = result["data"][0]
-        st.write("### Example Flagged Record:")
-        st.json(first_record)
-        
-        with st.spinner("Agent 2 is writing the audit explanation..."):
-            explanation = st.session_state.pipeline.agent_2_describe_violation(
-                rule_description, first_record
-            )
-            
-        st.write("### Auditor Explanation:")
-        st.info(explanation)
-        
-        # Add to audit log
-        log_entry = {
-            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "rule": rule_description,
-            "approved_sql": sql_query,
-            "flagged_count": result["count"],
-            "explanation": explanation
-        }
-        st.session_state.audit_log.append(log_entry)
+if "raw_df" not in st.session_state:
+    st.session_state.raw_df = None
 
 # --- UI Setup ---
 st.set_page_config(page_title="AI Data Policy Agent", layout="wide")
 st.title("🛡️ Data Policy Compliance Agent")
-st.markdown("Automated PDF-to-SQL rule validation with Human-in-the-Loop approval.")
+st.markdown("Automated PDF Policy -> Dynamic Pandas Mapping -> Executive Report")
 
-# Sidebar for Document Upload
-st.sidebar.header("1. Upload Policy Document")
-uploaded_file = st.sidebar.file_uploader("Upload AML Policy", type=["pdf", "txt"])
+import sys
+class StreamlitConsoleRedirect:
+    """Redirects print() statements to a Streamlit string buffer for live UI logs."""
+    def __init__(self, st_placeholder):
+        self.st_placeholder = st_placeholder
+        self.log_text = ""
+        self.terminal = sys.stdout
 
-if uploaded_file is not None:
-    if st.sidebar.button("Run Extractor Agent"):
-        text = extract_text_from_file(uploaded_file)
-        parse_policy(text)
+    def write(self, message):
+        self.terminal.write(message) # Keep in actual terminal
+        self.log_text += message
+        # Keep last 3000 chars to prevent UI lag on massive JSONs
+        display_text = self.log_text[-3000:]
+        # Use Markdown because st.code updates can be slightly jarred dynamically
+        self.st_placeholder.markdown(f"```json\n{display_text}\n```")
 
-# Main View: The HITL Interface
-if st.session_state.rules:
-    st.header("2. Review & Approve (Human-in-the-Loop)")
-    st.markdown("Agent 1 has translated the PDF rules into DuckDB SQL. Review before execution.")
+    def flush(self):
+        self.terminal.flush()
+
+import os
+
+# --- Sidebar ---
+st.sidebar.header("1. Upload Policy")
+uploaded_policy = st.sidebar.file_uploader("Upload Policy (PDF/TXT)", type=["pdf", "txt"])
+
+# --- Auto-Load Data ---
+data_dir = os.path.join(os.path.dirname(__file__), "data")
+available_csvs = [f for f in os.listdir(data_dir) if f.endswith(".csv")] if os.path.exists(data_dir) else []
+
+if available_csvs:
+    selected_csv = st.sidebar.selectbox("Select Repository Dataset", available_csvs)
+    csv_path = os.path.join(data_dir, selected_csv)
     
-    for idx, rule in enumerate(st.session_state.rules):
-        with st.expander(f"Rule: {rule['rule_name']}", expanded=True):
-            st.write(f"**Policy Text:** {rule['rule_description']}")
-            
-            # Allow the analyst to edit the SQL
-            edited_sql = st.text_area(
-                "Proposed SQL (Edit if needed):", 
-                value=rule['sql_query'], 
-                key=f"sql_{idx}"
-            )
-            
-            if st.button(f"Approve & Execute", key=f"run_{idx}"):
-                run_query(idx, edited_sql, rule['rule_description'])
+    # Only read if it changed or not loaded yet
+    if st.session_state.raw_df is None or "last_csv" not in st.session_state or st.session_state.last_csv != selected_csv:
+        try:
+            st.session_state.raw_df = pd.read_csv(csv_path)
+            st.session_state.last_csv = selected_csv
+        except Exception as e:
+            st.sidebar.error(f"Failed to load CSV: {e}")
 
-# Audit Log View
-if st.session_state.audit_log:
-    st.header("3. Audit Trail")
-    for log in st.session_state.audit_log:
-        st.json(log)
-    
-    # Download Button
-    audit_json = json.dumps(st.session_state.audit_log, indent=2)
-    st.download_button(
-        label="Download Full Audit Report",
-        data=audit_json,
-        file_name="Audit_Report.json",
-        mime="application/json"
-    )
+    if st.session_state.raw_df is not None:
+        st.sidebar.success(f"Loaded: `{selected_csv}` ({len(st.session_state.raw_df)} rows)")
+else:
+    st.sidebar.error("No CSV files found in the `data/` repository directory.")
+
+if uploaded_policy and st.session_state.raw_df is not None:
+    if st.sidebar.button("Run Full Agent Pipeline", type="primary"):
+        # Reset state on run
+        st.session_state.agent_1_rules = []
+        st.session_state.agent_2_mapped_rules = []
+        st.session_state.final_report = ""
+        
+        policy_text = extract_text_from_file(uploaded_policy)
+        executor = PandasExecutor(st.session_state.raw_df)
+        schema_info = executor.get_schema_summary()
+
+        # --- Live Backend Logging Window ---
+        st.subheader("🖥️ Live Backend Logs")
+        log_container = st.empty()
+        # Override output removed (no more websocket flooding!)
+        
+        try:
+            # [AGENT 1 EXECUTION]
+            with st.status("🕵️‍♂️ Agent 1: Extracting Rules & Generating Queries...", expanded=True) as status1:
+                try:
+                    def agent1_streamer():
+                        for chunk in st.session_state.pipeline.agent_1_extract_generic_rules(policy_text):
+                            if isinstance(chunk, tuple):
+                                st.session_state.agent1_result = chunk
+                            else:
+                                yield chunk
+                                
+                    with st.expander("Live JSON Parsing", expanded=True):
+                        st.write_stream(agent1_streamer())
+                        
+                    status, payload = st.session_state.agent1_result
+                    
+                    if status == "ERROR":
+                        st.error(payload)
+                        st.stop()
+                        
+                    st.session_state.agent_1_rules = payload
+                    st.write(f"✅ Extracted {len(st.session_state.agent_1_rules)} rules.")
+                    status1.update(state="complete")
+                except Exception as e:
+                    status1.update(label=f"Agent 1 Error: {e}", state="error")
+                    st.stop()
+
+            # [AGENT 2 EXECUTION - ASYNC BATCHING]
+            with st.status("🗺️ Agent 2: Mapping Schema & Values (Async)...", expanded=True) as status2:
+                try:
+                     import asyncio
+                     
+                     async def run_agent2_async():
+                         # We batch the rules to avoid hammering the API at once, but still run concurrently
+                         batch_size = 5
+                         all_mapped_rules = []
+                         
+                         # Create a placeholder for live updates
+                         progress_text = st.empty()
+                         progress_bar = st.progress(0)
+                         
+                         for i in range(0, len(st.session_state.agent_1_rules), batch_size):
+                             batch = st.session_state.agent_1_rules[i:i+batch_size]
+                             progress_text.text(f"Mapping batch {i//batch_size + 1}...")
+                             
+                             # Run the async pipeline method
+                             batch_results = await st.session_state.pipeline.agent_2_map_schema_and_values_async(
+                                 batch, 
+                                 schema_info['columns'], 
+                                 schema_info['sample_csv']
+                             )
+                             
+                             for res in batch_results:
+                                 if res[0] == "ERROR":
+                                     st.error(res[1])
+                                 elif res[0] == "DONE":
+                                     all_mapped_rules.extend([r.model_dump() for r in res[1].mapped_rules])
+                                     
+                             progress_bar.progress(min(1.0, (i + batch_size) / len(st.session_state.agent_1_rules)))
+                             
+                         return all_mapped_rules
+                         
+                     # Execute the async loop
+                     st.session_state.agent_2_mapped_rules = asyncio.run(run_agent2_async())
+                     
+                     for mapped in st.session_state.agent_2_mapped_rules:
+                         if mapped['status'] == 'SKIPPED':
+                             st.warning(f"⚠️ Skipped '{mapped['title']}': Missing columns.")
+                         else:
+                             st.success(f"✅ Mapped '{mapped['title']}' columns: {mapped['columns_remapped']}")
+                     
+                     status2.update(state="complete")
+                except Exception as e:
+                    status2.update(label=f"Agent 2 Error: {e}", state="error")
+                    st.stop()
+                    
+            # [AGENT 3 EXECUTION]
+            with st.status("⚙️ Agent 3: Executing Mapped Queries & Generating Report...", expanded=True) as status3:
+                try:
+                    # Run the scripts locally to get raw metrics
+                    st.write("Executing Pandas queries against DataFrame...")
+                    raw_metrics_json = executor.run_all_rules_and_collect_metrics(st.session_state.agent_2_mapped_rules)
+                    
+                    # Pass to LLM to generate Markdown Report live
+                    st.write("Generating Executive Report live...")
+                    
+                    def report_generator():
+                        for chunk in st.session_state.pipeline.agent_3_generate_executive_report(raw_metrics_json):
+                            print(chunk, end="", flush=True)
+                            yield chunk
+                            
+                    with st.expander("Viewing Agent 3 Brain (Live Report Generation)"):
+                        generated_report = st.write_stream(report_generator())
+                        
+                    st.session_state.final_report = generated_report.strip()
+                    status3.update(state="complete")
+                except Exception as e:
+                    status3.update(label=f"Agent 3 Error: {e}", state="error")
+                    st.stop()
+                    
+        finally:
+            # Always restore standard terminal behavior to avoid breaking Streamlit server
+            sys.stdout = sys.__stdout__
+
+def convert_md_to_pdf(md_text):
+    # Convert markdown to HTML (enabling tables)
+    html = markdown.markdown(md_text, extensions=['tables'])
+    # Add some basic styling for the PDF
+    styled_html = f"<html><head><style>body {{ font-family: Helvetica, sans-serif; }} table {{ border-collapse: collapse; width: 100%; }} th, td {{ border: 1px solid black; padding: 8px; text-align: left; }}</style></head><body>{html}</body></html>"
+    result = BytesIO()
+    pisa.CreatePDF(BytesIO(styled_html.encode("utf-8")), dest=result)
+    return result.getvalue()
+
+# --- Main View ---
+
+if st.session_state.final_report:
+    tab1, tab2, tab3 = st.tabs(["📑 Executive Report (Agent 3)", "🗺️ Schema Mapping (Agent 2)", "🗄️ Raw Data"])
+        
+    with tab1:
+        st.write("### AI Generated Executive Report")
+        st.markdown(st.session_state.final_report, unsafe_allow_html=True)
+        
+    with tab2:
+        st.write("This tab shows exactly how Agent 2 translated Agent 1's generic rules into executable Pandas.")
+        for rule in st.session_state.agent_2_mapped_rules:
+            with st.expander(f"{rule['rule_id']}: {rule['title']} ({rule['status']})"):
+                st.write("**Columns Remapped:**", rule['columns_remapped'])
+                st.write("**Values Remapped:**", rule['values_remapped'])
+                st.code(rule['sql_query'], language="sql")
+                st.write("↓ Maps To ↓")
+                st.code(rule['pandas_query'], language="python")
+                
+    with tab3:
+        st.dataframe(st.session_state.raw_df.head(100))
+        
+# End of file
