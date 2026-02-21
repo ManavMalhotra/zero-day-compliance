@@ -1,10 +1,8 @@
 import streamlit as st
 import pandas as pd
 import PyPDF2
-from io import StringIO
-import markdown
-from xhtml2pdf import pisa
-from io import BytesIO
+from io import StringIO, BytesIO
+from fpdf import FPDF
 
 from llm_pipeline import LLMPipeline
 from executor import PandasExecutor
@@ -175,13 +173,40 @@ if uploaded_policy and st.session_state.raw_df is not None:
             sys.stdout = sys.__stdout__
 
 def convert_md_to_pdf(md_text):
-    # Convert markdown to HTML (enabling tables)
-    html = markdown.markdown(md_text, extensions=['tables'])
-    # Add some basic styling for the PDF
-    styled_html = f"<html><head><style>body {{ font-family: Helvetica, sans-serif; }} table {{ border-collapse: collapse; width: 100%; }} th, td {{ border: 1px solid black; padding: 8px; text-align: left; }}</style></head><body>{html}</body></html>"
-    result = BytesIO()
-    pisa.CreatePDF(BytesIO(styled_html.encode("utf-8")), dest=result)
-    return result.getvalue()
+    """Convert markdown report to PDF using fpdf2 (pure Python, no native deps)."""
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font('Helvetica', size=10)
+    
+    for line in md_text.split('\n'):
+        stripped = line.strip()
+        # Handle headers
+        if stripped.startswith('### '):
+            pdf.set_font('Helvetica', 'B', 12)
+            pdf.multi_cell(0, 7, stripped[4:])
+            pdf.set_font('Helvetica', size=10)
+        elif stripped.startswith('## '):
+            pdf.set_font('Helvetica', 'B', 14)
+            pdf.multi_cell(0, 8, stripped[3:])
+            pdf.set_font('Helvetica', size=10)
+        elif stripped.startswith('# '):
+            pdf.set_font('Helvetica', 'B', 16)
+            pdf.multi_cell(0, 10, stripped[2:])
+            pdf.set_font('Helvetica', size=10)
+        elif stripped.startswith('|'):
+            # Table rows — render as fixed-width text
+            pdf.set_font('Courier', size=8)
+            pdf.multi_cell(0, 5, stripped)
+            pdf.set_font('Helvetica', size=10)
+        elif stripped.startswith('```'):
+            continue  # Skip code fences
+        elif stripped == '':
+            pdf.ln(3)
+        else:
+            pdf.multi_cell(0, 6, stripped)
+    
+    return pdf.output()
 
 # --- Main View ---
 
