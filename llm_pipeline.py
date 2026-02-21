@@ -11,7 +11,7 @@ import prompts
 load_dotenv()
 
 client = genai.Client()
-MODEL_ID = 'gemini-3-pro-preview'
+MODEL_ID = 'gemini-3-flash-preview'
 
 # --- Output Schemas ---
 
@@ -87,52 +87,44 @@ class LLMPipeline:
         prompt = prompts.AGENT_1_PROMPT.format(policy_text=policy_text)
         yield from self._generate_and_parse_json(prompt, Agent1Rule)
 
-    async def agent_2_map_schema_and_values_async(self, rules: List[Agent1Rule], dataset_columns: List[str], sample_data: str):
-        """Asynchronous version of Agent 2 designed to run concurrently."""
-        import asyncio
-        from google.genai import types
+    def agent_2_map_all_rules(self, rules: List[Agent1Rule], dataset_columns: List[str], sample_data: str):
+        """
+        Agent 2 (Schema Mapper) — Single batched LLM call for ALL rules.
+        Returns Agent2Response directly (no streaming needed for speed).
+        """
+        rules_json = json.dumps([r.model_dump() for r in rules], indent=2)
         
-        async def map_single_rule(rule: Agent1Rule):
-             prompt = prompts.AGENT_2_PROMPT.format(
-                 rules_json=json.dumps([rule.model_dump()], indent=2),
-                 dataset_columns=dataset_columns,
-                 sample_data=sample_data
-             )
-             
-             # Wrap synchronous genai generator in to_thread, ideally use async client if available
-             def sync_call():
-                 try:
-                     response = client.models.generate_content(
-                         model=MODEL_ID,
-                         contents=prompt,
-                         config=types.GenerateContentConfig(temperature=0.1)
-                     )
-                     
-                     cleaned = response.text.strip()
-                     if "```json" in cleaned:
-                         cleaned = cleaned.split("```json")[1].split("```")[0].strip()
-                     elif "```" in cleaned:
-                         cleaned = cleaned.split("```")[1].split("```")[0].strip()
-                         
-                     raw_data = json.loads(cleaned)
-                     
-                     # Check if it returned a dict with 'mapped_rules' or a flat list
-                     if isinstance(raw_data, dict) and 'mapped_rules' in raw_data:
-                         raw_list = raw_data['mapped_rules']
-                     elif isinstance(raw_data, list):
-                         raw_list = raw_data
-                     else:
-                         return ("ERROR", f"Agent 2 output unexpected format: {type(raw_data)}")
-                         
-                     return ("DONE", Agent2Response(mapped_rules=[Agent2MappedRule(**r) for r in raw_list]))
-                 except Exception as e:
-                     return ("ERROR", f"Async mapping failed: {e}")
-                     
-             return await asyncio.to_thread(sync_call)
-             
-        # Execute all rules in the batch concurrently
-        tasks = [map_single_rule(r) for r in rules]
-        return await asyncio.gather(*tasks)
+        prompt = prompts.AGENT_2_PROMPT.format(
+            rules_json=rules_json,
+            dataset_columns=dataset_columns,
+            sample_data=sample_data
+        )
+        
+        try:
+            response = client.models.generate_content(
+                model=MODEL_ID,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.1)
+            )
+            
+            cleaned = response.text.strip()
+            if "```json" in cleaned:
+                cleaned = cleaned.split("```json")[1].split("```")[0].strip()
+            elif "```" in cleaned:
+                cleaned = cleaned.split("```")[1].split("```")[0].strip()
+                
+            raw_data = json.loads(cleaned)
+            
+            if isinstance(raw_data, dict) and 'mapped_rules' in raw_data:
+                raw_list = raw_data['mapped_rules']
+            elif isinstance(raw_data, list):
+                raw_list = raw_data
+            else:
+                return ("ERROR", f"Agent 2 unexpected format: {type(raw_data)}")
+                
+            return ("DONE", Agent2Response(mapped_rules=[Agent2MappedRule(**r) for r in raw_list]))
+        except Exception as e:
+            return ("ERROR", f"Agent 2 mapping failed: {e}")
 
     def agent_2_map_schema_and_values(self, rules: List[Agent1Rule], dataset_columns: List[str], sample_data: str):
         """

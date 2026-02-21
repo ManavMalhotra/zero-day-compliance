@@ -117,7 +117,9 @@ class PandasExecutor:
                     "severity": rule['severity'],
                     "status": "SKIPPED",
                     "violation_count": 0,
-                    "total_amount_exposure": 0
+                    "total_amount_exposure": 0,
+                    "sql_query": rule.get('sql_query', ''),
+                    "pandas_query": rule.get('pandas_query', '')
                 })
                 continue
                 
@@ -219,7 +221,15 @@ class PandasExecutor:
                     "avg_amount": float(avg_amount),
                     "date_range": date_range,
                     "top_offenders": top_offenders,
+                    "sql_query": rule.get('sql_query', ''),
+                    "pandas_query": rule.get('pandas_query', ''),
                     "sample_offending_row": sample_df.to_dict(orient="records") if count > 0 else []
                 })
                 
-        return json.dumps(metrics, separators=(',', ':'), default=str)
+        # Strip bulky sample rows before sending to LLM — Agent 3 only needs aggregated metrics
+        lean_metrics = []
+        for m in metrics:
+            lean = {k: v for k, v in m.items() if k != 'sample_offending_row'}
+            lean_metrics.append(lean)
+        
+        return json.dumps(lean_metrics, separators=(',', ':'), default=str)

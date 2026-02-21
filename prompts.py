@@ -91,6 +91,14 @@ For each flagged rule (violations > 0), use this format:
 
 **Top Offenders**: List top 3 accounts with transaction counts.
 
+**Replication Queries** (for developer verification):
+```sql
+[sql_query from metrics]
+```
+```python
+df.query("[pandas_query from metrics]")
+```
+
 **Compliance Action**: Detailed, specific operational action based on the violation count (e.g. "File CTR for all X transactions").
 
 ## 📋 Priority Action List

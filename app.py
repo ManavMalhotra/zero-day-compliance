@@ -120,47 +120,24 @@ if uploaded_policy and st.session_state.raw_df is not None:
                     status1.update(label=f"Agent 1 Error: {e}", state="error")
                     st.stop()
 
-            # [AGENT 2 EXECUTION - ASYNC BATCHING]
-            with st.status("🗺️ Agent 2: Mapping Schema & Values (Async)...", expanded=True) as status2:
+            # [AGENT 2 EXECUTION - SINGLE BATCHED CALL]
+            with st.status("🗺️ Agent 2: Mapping Schema & Values...", expanded=True) as status2:
                 try:
-                     import asyncio
+                     result = st.session_state.pipeline.agent_2_map_all_rules(
+                         st.session_state.agent_1_rules,
+                         schema_info['columns'],
+                         schema_info['sample_csv']
+                     )
                      
-                     async def run_agent2_async():
-                         # We batch the rules to avoid hammering the API at once, but still run concurrently
-                         batch_size = 5
-                         all_mapped_rules = []
-                         
-                         # Create a placeholder for live updates
-                         progress_text = st.empty()
-                         progress_bar = st.progress(0)
-                         
-                         for i in range(0, len(st.session_state.agent_1_rules), batch_size):
-                             batch = st.session_state.agent_1_rules[i:i+batch_size]
-                             progress_text.text(f"Mapping batch {i//batch_size + 1}...")
-                             
-                             # Run the async pipeline method
-                             batch_results = await st.session_state.pipeline.agent_2_map_schema_and_values_async(
-                                 batch, 
-                                 schema_info['columns'], 
-                                 schema_info['sample_csv']
-                             )
-                             
-                             for res in batch_results:
-                                 if res[0] == "ERROR":
-                                     st.error(res[1])
-                                 elif res[0] == "DONE":
-                                     all_mapped_rules.extend([r.model_dump() for r in res[1].mapped_rules])
-                                     
-                             progress_bar.progress(min(1.0, (i + batch_size) / len(st.session_state.agent_1_rules)))
-                             
-                         return all_mapped_rules
-                         
-                     # Execute the async loop
-                     st.session_state.agent_2_mapped_rules = asyncio.run(run_agent2_async())
+                     if result[0] == "ERROR":
+                         st.error(result[1])
+                         st.stop()
+                     
+                     st.session_state.agent_2_mapped_rules = [r.model_dump() for r in result[1].mapped_rules]
                      
                      for mapped in st.session_state.agent_2_mapped_rules:
                          if mapped['status'] == 'SKIPPED':
-                             st.warning(f"⚠️ Skipped '{mapped['title']}': Missing columns.")
+                             st.warning(f"⚠️ Skipped '{mapped['title']}': {mapped.get('skip_reason', 'Missing columns.')}")
                          else:
                              st.success(f"✅ Mapped '{mapped['title']}' columns: {mapped['columns_remapped']}")
                      
@@ -214,6 +191,30 @@ if st.session_state.final_report:
     with tab1:
         st.write("### AI Generated Executive Report")
         st.markdown(st.session_state.final_report, unsafe_allow_html=True)
+        
+        # Download Buttons
+        st.divider()
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                label="📥 Download Report (Markdown)",
+                data=st.session_state.final_report,
+                file_name="compliance_report.md",
+                mime="text/markdown",
+                use_container_width=True
+            )
+        with col2:
+            try:
+                pdf_bytes = convert_md_to_pdf(st.session_state.final_report)
+                st.download_button(
+                    label="📥 Download Report (PDF)",
+                    data=pdf_bytes,
+                    file_name="compliance_report.pdf",
+                    mime="application/pdf",
+                    use_container_width=True
+                )
+            except Exception as e:
+                st.warning(f"PDF generation unavailable: {e}")
         
     with tab2:
         st.write("This tab shows exactly how Agent 2 translated Agent 1's generic rules into executable Pandas.")
