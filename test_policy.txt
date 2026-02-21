@@ -1,0 +1,7 @@
+Anti-Money Laundering (AML) Compliance Policy v2.1
+
+1. High-Value Transaction Structuring
+Any single transaction where the amount paid is greater than $50,000 USD must be flagged for immediate review as a high-value anomaly.
+
+2. Sanctioned Entity Transfers
+Any transaction where the receiving account (To_Account) belongs to an entity listed on our internal Sanctions List must be flagged as a critical violation of OFAC regulations.
