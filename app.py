@@ -1,12 +1,11 @@
 import streamlit as st
 import pandas as pd
-import PyPDF2
-from io import StringIO, BytesIO
+from datetime import datetime
 from fpdf import FPDF
 
 from llm_pipeline import LLMPipeline
 from executor import PandasExecutor
-from utils import extract_text_from_file
+from utils import build_schema_context, extract_text_from_file
 
 # --- State Management ---
 if "pipeline" not in st.session_state:
@@ -24,31 +23,26 @@ if "final_report" not in st.session_state:
 if "raw_df" not in st.session_state:
     st.session_state.raw_df = None
 
+if "run_logs" not in st.session_state:
+    st.session_state.run_logs = []
+
 # --- UI Setup ---
 st.set_page_config(page_title="AI Data Policy Agent", layout="wide")
 st.title("🛡️ Data Policy Compliance Agent")
 st.markdown("Automated PDF Policy -> Dynamic Pandas Mapping -> Executive Report")
 
-import sys
-class StreamlitConsoleRedirect:
-    """Redirects print() statements to a Streamlit string buffer for live UI logs."""
-    def __init__(self, st_placeholder):
-        self.st_placeholder = st_placeholder
-        self.log_text = ""
-        self.terminal = sys.stdout
-
-    def write(self, message):
-        self.terminal.write(message) # Keep in actual terminal
-        self.log_text += message
-        # Keep last 3000 chars to prevent UI lag on massive JSONs
-        display_text = self.log_text[-3000:]
-        # Use Markdown because st.code updates can be slightly jarred dynamically
-        self.st_placeholder.markdown(f"```json\n{display_text}\n```")
-
-    def flush(self):
-        self.terminal.flush()
-
 import os
+
+
+def make_streamlit_logger(placeholder):
+    """Creates a UI logger that updates the visible log pane immediately."""
+    def append_log(message: str):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        entry = f"[{timestamp}] {message}"
+        st.session_state.run_logs.append(entry)
+        placeholder.code("\n".join(st.session_state.run_logs[-200:]), language="text")
+
+    return append_log
 
 # --- Sidebar ---
 st.sidebar.header("1. Upload Policy")
@@ -85,49 +79,60 @@ if uploaded_policy and st.session_state.raw_df is not None:
         policy_text = extract_text_from_file(uploaded_policy)
         executor = PandasExecutor(st.session_state.raw_df)
         schema_info = executor.get_schema_summary()
+        schema_context = build_schema_context(st.session_state.raw_df)
 
         # --- Live Backend Logging Window ---
         st.subheader("🖥️ Live Backend Logs")
         log_container = st.empty()
-        # Override output removed (no more websocket flooding!)
+        st.session_state.run_logs = []
+        append_log = make_streamlit_logger(log_container)
+        append_log("Pipeline run started.")
+        append_log(f"Loaded dataset with {len(st.session_state.raw_df):,} rows and {len(schema_info['columns']):,} columns.")
         
         try:
             # [AGENT 1 EXECUTION]
-            with st.status("🕵️‍♂️ Agent 1: Extracting Rules & Generating Queries...", expanded=True) as status1:
+            with st.status("🕵️‍♂️ Agent 1: Extracting Rules...", expanded=True) as status1:
                 try:
                     def agent1_streamer():
-                        for chunk in st.session_state.pipeline.agent_1_extract_generic_rules(policy_text):
+                        for chunk in st.session_state.pipeline.agent_1_extract_generic_rules(policy_text, on_log=append_log):
                             if isinstance(chunk, tuple):
                                 st.session_state.agent1_result = chunk
                             else:
                                 yield chunk
                                 
+                    append_log("Agent 1 started.")
                     with st.expander("Live JSON Parsing", expanded=True):
                         st.write_stream(agent1_streamer())
                         
                     status, payload = st.session_state.agent1_result
                     
                     if status == "ERROR":
+                        append_log(f"Agent 1 error: {payload}")
                         st.error(payload)
                         st.stop()
                         
                     st.session_state.agent_1_rules = payload
+                    append_log(f"Agent 1 completed. Extracted {len(st.session_state.agent_1_rules)} rules.")
                     st.write(f"✅ Extracted {len(st.session_state.agent_1_rules)} rules.")
                     status1.update(state="complete")
                 except Exception as e:
+                    append_log(f"Agent 1 error: {e}")
                     status1.update(label=f"Agent 1 Error: {e}", state="error")
                     st.stop()
 
             # [AGENT 2 EXECUTION - SINGLE BATCHED CALL]
             with st.status("🗺️ Agent 2: Mapping Schema & Values...", expanded=True) as status2:
                 try:
+                     append_log("Agent 2 started.")
                      result = st.session_state.pipeline.agent_2_map_all_rules(
                          st.session_state.agent_1_rules,
                          schema_info['columns'],
-                         schema_info['sample_csv']
+                         schema_context,
+                         on_log=append_log,
                      )
                      
                      if result[0] == "ERROR":
+                         append_log(f"Agent 2 error: {result[1]}")
                          st.error(result[1])
                          st.stop()
                      
@@ -139,8 +144,10 @@ if uploaded_policy and st.session_state.raw_df is not None:
                          else:
                              st.success(f"✅ Mapped '{mapped['title']}' columns: {mapped['columns_remapped']}")
                      
+                     append_log(f"Agent 2 completed. Prepared {len(st.session_state.agent_2_mapped_rules)} mapped rules.")
                      status2.update(state="complete")
                 except Exception as e:
+                    append_log(f"Agent 2 error: {e}")
                     status2.update(label=f"Agent 2 Error: {e}", state="error")
                     st.stop()
                     
@@ -148,39 +155,72 @@ if uploaded_policy and st.session_state.raw_df is not None:
             with st.status("⚙️ Agent 3: Executing Mapped Queries & Generating Report...", expanded=True) as status3:
                 try:
                     # Run the scripts locally to get raw metrics
+                    append_log("Agent 3 execution started.")
                     st.write("Executing Pandas queries against DataFrame...")
-                    raw_metrics_json = executor.run_all_rules_and_collect_metrics(st.session_state.agent_2_mapped_rules)
+                    raw_metrics_json = executor.run_all_rules_and_collect_metrics(
+                        st.session_state.agent_2_mapped_rules,
+                        on_log=append_log,
+                    )
                     
                     # Pass to LLM to generate Markdown Report live
                     st.write("Generating Executive Report live...")
                     
                     def report_generator():
-                        for chunk in st.session_state.pipeline.agent_3_generate_executive_report(raw_metrics_json):
-                            print(chunk, end="", flush=True)
+                        for chunk in st.session_state.pipeline.agent_3_generate_executive_report(
+                            raw_metrics_json,
+                            on_log=append_log,
+                        ):
                             yield chunk
                             
                     with st.expander("Viewing Agent 3 Brain (Live Report Generation)"):
                         generated_report = st.write_stream(report_generator())
                         
                     st.session_state.final_report = generated_report.strip()
+                    append_log("Agent 3 completed. Final report is ready.")
                     status3.update(state="complete")
                 except Exception as e:
+                    append_log(f"Agent 3 error: {e}")
                     status3.update(label=f"Agent 3 Error: {e}", state="error")
                     st.stop()
-                    
         finally:
-            # Always restore standard terminal behavior to avoid breaking Streamlit server
-            sys.stdout = sys.__stdout__
+            append_log("Pipeline run finished.")
 
 def convert_md_to_pdf(md_text):
     """Convert markdown report to PDF using fpdf2 (pure Python, no native deps)."""
+    def pdf_safe(text: str) -> str:
+        """
+        fpdf's core fonts only support latin-1, so replace unsupported characters
+        with close ASCII equivalents instead of failing the whole export.
+        """
+        replacements = {
+            "📑": "",
+            "📊": "",
+            "🚨": "[FLAGGED]",
+            "✅": "[CLEAN]",
+            "⚠️": "[SKIPPED]",
+            "❌": "[ERROR]",
+            "🚩": "",
+            "📋": "",
+            "→": "->",
+            "↓": "->",
+            "—": "-",
+            "–": "-",
+            "•": "-",
+        }
+
+        cleaned = text
+        for source, target in replacements.items():
+            cleaned = cleaned.replace(source, target)
+
+        return cleaned.encode("latin-1", errors="replace").decode("latin-1")
+
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
     pdf.set_font('Helvetica', size=10)
     
     for line in md_text.split('\n'):
-        stripped = line.strip()
+        stripped = pdf_safe(line.strip())
         # Handle headers
         if stripped.startswith('### '):
             pdf.set_font('Helvetica', 'B', 12)

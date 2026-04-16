@@ -1,9 +1,12 @@
 AGENT_1_PROMPT = """You are Agent 1 — Policy Interpreter.
 
-You receive a compliance policy document (PDF text).
-Extract every enforceable rule and generate generic queries.
+You receive a compliance policy document excerpt.
+Extract only enforceable, testable rules and generate generic queries.
 
-STEP 1 — Extract rules as JSON matching this schema exactly:
+Return raw JSON only, with one object per enforceable rule. Do not wrap in markdown fences.
+Ignore background text, definitions, examples, and non-testable guidance.
+
+JSON schema:
 [
   {{
     "rule_id": "Rule 3.1",
@@ -21,21 +24,21 @@ STEP 1 — Extract rules as JSON matching this schema exactly:
 RULES FOR QUERIES:
 - Generic Schema: Table: transactions. Columns: tx_id, timestamp, sender_account, receiver_account, amount, currency, tx_type, sender_country, receiver_country
 - SQL: SQLite dialect. No placeholders. SELECT must include: tx_id, timestamp, sender_account, receiver_account, amount, tx_type. Return ONLY violating records.
-- Pandas: Generate ONE string to be evaluated inside `df.query()`. DO NOT use `df[` or variables. Use standard operators (`and`, `or`, `==`, `>=`, `<=`, `in`).
-
-Output raw JSON array only.
+- Pandas: Generate ONE string to be evaluated inside `df.query()`. Do not use `df[` or variables.
+- Be concise. Keep `description` and `explanation` to one sentence each.
 
 POLICY TEXT:
 {policy_text}"""
 
 AGENT_2_PROMPT = """You are Agent 2 — Schema Mapper.
 
-You receive a QueryPlan JSON from Agent 1 and a Schema Context JSON from the actual dataset.
+You receive a QueryPlan JSON from Agent 1 and a compact schema profile from the actual dataset.
 Rewrite every query using the real column names and real values. Do NOT change logic or thresholds.
 
 STEP 1 — Map Columns: match by MEANING (e.g. `amount` -> `trans_amt`, `sender_account` -> `from_acct`).
 STEP 2 — Map Values: check sample data to align values (e.g. `cash_deposit` -> `CASH-IN`, `Iran` -> `IR`).
 STEP 3 — Rewrite Queries: replace generic columns and values in `sql_query` and `pandas_query` with actual ones.
+If a required column is missing, mark the rule as `SKIPPED` and explain why.
 
 OUTPUT raw JSON exactly like this:
 {{
@@ -54,14 +57,14 @@ OUTPUT raw JSON exactly like this:
   ]
 }}
 
-Output raw JSON strictly matching the Agent2Response schema (list of mapped_rules).
+Return raw JSON only. No prose, no markdown fences.
 
 GENERIC QUERIES & RULES (From Agent 1):
 {rules_json}
 
 DATASET COLUMNS (Actual Schema):
 {dataset_columns}
-SAMPLE DATA / CONTEXT:
+SCHEMA PROFILE / SAMPLE VALUES:
 {sample_data}"""
 
 

@@ -72,28 +72,30 @@ class PandasExecutor:
             }, default=str)
         }
 
-    def execute_mapped_query(self, mapped_query: str):
+    def _log(self, on_log, message: str):
+        if on_log:
+            on_log(message)
+
+    def execute_mapped_query(self, mapped_query: str, on_log=None):
         """
-        Executes dynamically mapped Pandas queries safely using df.eval() rather than query() to get a boolean mask.
-        Returns indices of violations rather than a full copied DataFrame for memory efficiency.
+        Executes mapped Pandas query strings with DataFrame.query(), which matches
+        the syntax required in the prompts and supports backtick-escaped columns.
         """
         try:
             if not mapped_query or str(mapped_query).strip() == "":
                  return {"success": False, "error": "Empty query string."}
-                 
-            # df.eval returns a boolean mask, meaning we don't immediately copy rows.
-            mask = self.df.eval(mapped_query)
-            
-            # Count True values in mask without allocating memory
-            violation_count = mask.sum()
-            
-            # Save strictly what is needed: a small sample and the mask indices
+
+            filtered_df = self.df.query(mapped_query, engine="python")
+            violation_count = len(filtered_df)
+
             if violation_count > 0:
-                sample_df = self.df[mask].head(5).copy()
-                violation_indices = mask[mask].index
+                sample_df = filtered_df.head(5).copy()
+                violation_indices = filtered_df.index
             else:
-                 sample_df = pd.DataFrame()
-                 violation_indices = pd.Index([])
+                sample_df = pd.DataFrame()
+                violation_indices = pd.Index([])
+
+            self._log(on_log, f"Query executed successfully. Matched {violation_count} rows.")
             
             return {
                 "success": True,
@@ -102,15 +104,17 @@ class PandasExecutor:
                 "sample_df": sample_df
             }
         except Exception as e:
+            self._log(on_log, f"Query execution failed: {e}")
             return {"success": False, "error": str(e)}
 
-    def run_all_rules_and_collect_metrics(self, rules_from_agent2):
+    def run_all_rules_and_collect_metrics(self, rules_from_agent2, on_log=None):
         """Runs Agent 3's execution loop and compiles the metric dictionary for reporting."""
         metrics = []
         
         for rule in rules_from_agent2:
             # If Agent 2 skipped it because of missing columns
             if rule['status'] != 'READY' or not rule['pandas_query']:
+                self._log(on_log, f"Skipping {rule['rule_id']} - {rule['title']} because Agent 2 marked it as {rule['status']}.")
                 metrics.append({
                     "rule_id": rule['rule_id'],
                     "title": rule['title'],
@@ -123,11 +127,11 @@ class PandasExecutor:
                 })
                 continue
                 
-            print(f"Agent 3: Executing mapped query for '{rule['title']}'...")
-            result = self.execute_mapped_query(rule['pandas_query'])
+            self._log(on_log, f"Executing {rule['rule_id']} - {rule['title']}.")
+            result = self.execute_mapped_query(rule['pandas_query'], on_log=on_log)
             
             if not result["success"]:
-                 print(f"  [ERROR] {result['error']}")
+                 self._log(on_log, f"{rule['rule_id']} failed: {result['error']}")
                  metrics.append({
                     "rule_id": rule['rule_id'],
                     "title": rule['title'],
@@ -138,7 +142,7 @@ class PandasExecutor:
                 })
             else:
                 count = result["violation_count"]
-                print(f"  [SUCCESS] Found {count} violations.")
+                self._log(on_log, f"{rule['rule_id']} completed with {count} matched rows.")
                 
                 # Default generic metrics
                 unique_accounts = 0
@@ -179,7 +183,7 @@ class PandasExecutor:
                             total_exposure = amounts.sum()
                             avg_amount = amounts.mean()
                         except Exception as e:
-                            print(f"[Warning] Failed to aggregate amount column {target_amount_col}: {e}")
+                            self._log(on_log, f"Warning: failed amount aggregation for {target_amount_col}: {e}")
                             
                     if target_date_col and target_date_col in self.df.columns:
                         try:
@@ -187,7 +191,7 @@ class PandasExecutor:
                             if not dates.empty:
                                 date_range = f"{dates.min().strftime('%Y-%m-%d %H:%M')} to {dates.max().strftime('%Y-%m-%d %H:%M')}"
                         except Exception as e:
-                            print(f"[Warning] Failed to find date range for {target_date_col}: {e}")
+                            self._log(on_log, f"Warning: failed date aggregation for {target_date_col}: {e}")
                             
                     if target_account_col and target_account_col in self.df.columns:
                         try:
@@ -196,7 +200,7 @@ class PandasExecutor:
                             top_3 = accounts.value_counts().head(3)
                             top_offenders = [f"{acct} ({val} txns)" for acct, val in top_3.items()]
                         except Exception as e:
-                            print(f"[Warning] Failed to extract top offenders for {target_account_col}: {e}")
+                            self._log(on_log, f"Warning: failed offender aggregation for {target_account_col}: {e}")
                 
                 # Risk Score (1-10)
                 base_scores = {"CRITICAL": 8, "HIGH": 5, "MEDIUM": 3, "LOW": 1}
@@ -225,11 +229,13 @@ class PandasExecutor:
                     "pandas_query": rule.get('pandas_query', ''),
                     "sample_offending_row": sample_df.to_dict(orient="records") if count > 0 else []
                 })
+                self._log(on_log, f"{rule['rule_id']} metrics ready. Risk score {risk_score}/10, exposure {float(total_exposure):,.2f}.")
                 
         # Strip bulky sample rows before sending to LLM — Agent 3 only needs aggregated metrics
         lean_metrics = []
         for m in metrics:
             lean = {k: v for k, v in m.items() if k != 'sample_offending_row'}
             lean_metrics.append(lean)
-        
+
+        self._log(on_log, f"Prepared execution metrics for {len(lean_metrics)} rules.")
         return json.dumps(lean_metrics, separators=(',', ':'), default=str)
