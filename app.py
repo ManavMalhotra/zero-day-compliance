@@ -88,6 +88,11 @@ if uploaded_policy and st.session_state.raw_df is not None:
         append_log = make_streamlit_logger(log_container)
         append_log("Pipeline run started.")
         append_log(f"Loaded dataset with {len(st.session_state.raw_df):,} rows and {len(schema_info['columns']):,} columns.")
+        append_log(
+            "Gemini model chain: "
+            + ", ".join(st.session_state.pipeline.configured_models())
+            + " (with free-tier rate guards and fallback)."
+        )
         
         try:
             # [AGENT 1 EXECUTION]

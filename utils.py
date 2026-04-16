@@ -29,13 +29,14 @@ def normalize_whitespace(text: str) -> str:
     return normalized.strip()
 
 
-def optimize_policy_text(policy_text: str, max_chars: int = 12000, max_paragraphs: int = 18) -> str:
+def optimize_policy_text(policy_text: str, max_chars: int = 28000, max_paragraphs: int = 40) -> str:
     """
-    Reduces long policy documents into the most rule-dense paragraphs.
+    Preserves full policy context for normal-sized documents and only compacts
+    extremely long policies when they exceed a generous prompt budget.
 
-    This keeps the first paragraph for context, then ranks remaining paragraphs
-    using policy-specific heuristics so we preserve obligations, thresholds, and
-    exception language instead of sending the whole PDF verbatim.
+    The goal is not aggressive summarization. We keep the entire normalized
+    policy whenever it fits comfortably, and only then rank paragraphs so we
+    preserve obligations, thresholds, headings, and exception language.
     """
     normalized = normalize_whitespace(policy_text)
     if len(normalized) <= max_chars:
@@ -61,6 +62,8 @@ def optimize_policy_text(policy_text: str, max_chars: int = 12000, max_paragraph
             score += 3
         if re.search(r"[$€£₹%]", paragraph):
             score += 2
+        if re.search(r"^\s*(\d+(\.\d+)*|[A-Z][A-Z\s]{3,}|Section|Rule|Clause)\b", paragraph):
+            score += 3
         if re.search(r"\b(rule|section|article|clause|control)\b", lower):
             score += 2
         if 80 <= len(paragraph) <= 1200:
