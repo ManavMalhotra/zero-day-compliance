@@ -13,6 +13,7 @@ load_dotenv()
 
 client = genai.Client()
 MODEL_ID = 'gemini-3-flash-preview'
+AGENT_2_BATCH_SIZE = 4
 
 # --- Output Schemas ---
 
@@ -60,6 +61,113 @@ class LLMPipeline:
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         return f"{stage_name}:{digest}"
 
+    def _strip_markdown_fences(self, text: str) -> str:
+        cleaned = (text or "").strip()
+        if "```json" in cleaned:
+            cleaned = cleaned.split("```json", 1)[1].split("```", 1)[0].strip()
+        elif "```" in cleaned:
+            cleaned = cleaned.split("```", 1)[1].split("```", 1)[0].strip()
+        return cleaned
+
+    def _extract_json_block(self, text: str) -> str:
+        """Extracts the first balanced JSON object/array from a noisy response."""
+        cleaned = self._strip_markdown_fences(text)
+        start_positions = [pos for pos in (cleaned.find("{"), cleaned.find("[")) if pos != -1]
+        if not start_positions:
+            return cleaned
+
+        start = min(start_positions)
+        opening = cleaned[start]
+        closing = "}" if opening == "{" else "]"
+        depth = 0
+        in_string = False
+        escape = False
+
+        for index in range(start, len(cleaned)):
+            char = cleaned[index]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+            elif char == opening:
+                depth += 1
+            elif char == closing:
+                depth -= 1
+                if depth == 0:
+                    return cleaned[start:index + 1]
+
+        return cleaned[start:]
+
+    def _parse_json_text(self, raw_text: str):
+        cleaned = self._strip_markdown_fences(raw_text)
+        candidates = [cleaned]
+
+        extracted = self._extract_json_block(cleaned)
+        if extracted and extracted not in candidates:
+            candidates.append(extracted)
+
+        last_error = None
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError as error:
+                last_error = error
+
+        if last_error:
+            raise last_error
+        raise json.JSONDecodeError("No JSON payload found.", cleaned, 0)
+
+    def _parse_to_model(self, raw_text: str, pydantic_model):
+        raw_data = self._parse_json_text(raw_text)
+        if isinstance(raw_data, list):
+            return [pydantic_model(**r) for r in raw_data]
+        return pydantic_model(**raw_data)
+
+    def _repair_json(self, raw_text: str, schema_hint: str, stage_name: str, on_log=None) -> str:
+        repair_prompt = prompts.JSON_REPAIR_PROMPT.format(
+            schema_hint=schema_hint,
+            raw_text=raw_text[:20000],
+        )
+        self._log(on_log, f"{stage_name}: attempting JSON repair.")
+        response = client.models.generate_content(
+            model=MODEL_ID,
+            contents=repair_prompt,
+            config=types.GenerateContentConfig(temperature=0)
+        )
+        return response.text or ""
+
+    def _parse_with_repair(self, raw_text: str, pydantic_model, schema_hint: str, stage_name: str, on_log=None):
+        try:
+            return self._parse_to_model(raw_text, pydantic_model)
+        except Exception as error:
+            self._log(on_log, f"{stage_name}: response validation failed ({error}).")
+            repaired_text = self._repair_json(raw_text, schema_hint, stage_name, on_log=on_log)
+            return self._parse_to_model(repaired_text, pydantic_model)
+
+    def _serialize_agent_2_rules(self, rules: List[Agent1Rule]) -> str:
+        minimized_rules = [
+            {
+                "rule_id": rule.rule_id,
+                "title": rule.title,
+                "severity": rule.severity,
+                "sql_query": rule.sql_query,
+                "pandas_query": rule.pandas_query,
+            }
+            for rule in rules
+        ]
+        return json.dumps(minimized_rules, separators=(",", ":"))
+
+    def _chunk_rules(self, rules: List[Agent1Rule], chunk_size: int = AGENT_2_BATCH_SIZE):
+        for index in range(0, len(rules), chunk_size):
+            yield rules[index:index + chunk_size]
+
     def _generate_and_parse_json(self, prompt: str, pydantic_model, stage_name: str, on_log=None, cache_key: Optional[str] = None):
         """Helper to yield raw stream tokens, then clean and parse the final JSON."""
         if cache_key and cache_key in self._cache:
@@ -86,19 +194,19 @@ class LLMPipeline:
                 self._log(on_log, f"{stage_name}: received {len(full_text)} response characters.")
                 next_progress_mark += 600
             
-        # Clean markdown fences if present
-        cleaned = full_text.strip()
-        if "```json" in cleaned:
-            cleaned = cleaned.split("```json")[1].split("```")[0].strip()
-        elif "```" in cleaned:
-            cleaned = cleaned.split("```")[1].split("```")[0].strip()
-            
         try:
-            raw_data = json.loads(cleaned)
-            if isinstance(raw_data, list):
-                parsed = [pydantic_model(**r) for r in raw_data]
-            else:
-                parsed = pydantic_model(**raw_data)
+            base_schema_hint = pydantic_model.model_json_schema()
+            if stage_name == "Agent 1":
+                base_schema_hint = {"type": "array", "items": base_schema_hint}
+
+            schema_hint = json.dumps(base_schema_hint, separators=(",", ":"))
+            parsed = self._parse_with_repair(
+                full_text,
+                pydantic_model,
+                schema_hint=schema_hint,
+                stage_name=stage_name,
+                on_log=on_log,
+            )
             if cache_key:
                 self._cache[cache_key] = parsed
             self._log(on_log, f"{stage_name}: parsed response successfully.")
@@ -136,49 +244,64 @@ class LLMPipeline:
         Agent 2 (Schema Mapper) — Single batched LLM call for ALL rules.
         Returns Agent2Response directly (no streaming needed for speed).
         """
-        rules_json = json.dumps([r.model_dump() for r in rules], separators=(",", ":"))
-        
-        prompt = prompts.AGENT_2_PROMPT.format(
-            rules_json=rules_json,
-            dataset_columns=dataset_columns,
-            sample_data=sample_data
+        dataset_columns_json = json.dumps(dataset_columns, separators=(",", ":"))
+        chunks = list(self._chunk_rules(rules))
+        combined_rules = []
+
+        self._log(
+            on_log,
+            f"Agent 2: split {len(rules)} rules into {len(chunks)} chunk(s) of up to {AGENT_2_BATCH_SIZE} rules.",
         )
-        cache_key = self._cache_key("agent_2", f"{rules_json}|{dataset_columns}|{sample_data}")
-        
-        try:
-            if cache_key in self._cache:
-                self._log(on_log, "Agent 2: cache hit.")
-                return ("DONE", self._cache[cache_key])
 
-            self._log(on_log, f"Agent 2: sending prompt (~{self._approx_token_count(prompt)} tokens).")
-            response = client.models.generate_content(
-                model=MODEL_ID,
-                contents=prompt,
-                config=types.GenerateContentConfig(temperature=0.1)
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            rules_json = self._serialize_agent_2_rules(chunk)
+            prompt = prompts.AGENT_2_PROMPT.format(
+                rules_json=rules_json,
+                dataset_columns=dataset_columns_json,
+                sample_data=sample_data
             )
-            
-            cleaned = response.text.strip()
-            if "```json" in cleaned:
-                cleaned = cleaned.split("```json")[1].split("```")[0].strip()
-            elif "```" in cleaned:
-                cleaned = cleaned.split("```")[1].split("```")[0].strip()
-                
-            raw_data = json.loads(cleaned)
-            
-            if isinstance(raw_data, dict) and 'mapped_rules' in raw_data:
-                raw_list = raw_data['mapped_rules']
-            elif isinstance(raw_data, list):
-                raw_list = raw_data
-            else:
-                return ("ERROR", f"Agent 2 unexpected format: {type(raw_data)}")
+            cache_key = self._cache_key(
+                f"agent_2_chunk_{chunk_index}",
+                f"{rules_json}|{dataset_columns_json}|{sample_data}",
+            )
 
-            parsed = Agent2Response(mapped_rules=[Agent2MappedRule(**r) for r in raw_list])
-            self._cache[cache_key] = parsed
-            self._log(on_log, f"Agent 2: mapped {len(parsed.mapped_rules)} rules successfully.")
-            return ("DONE", parsed)
-        except Exception as e:
-            self._log(on_log, f"Agent 2 failed: {e}")
-            return ("ERROR", f"Agent 2 mapping failed: {e}")
+            try:
+                if cache_key in self._cache:
+                    self._log(on_log, f"Agent 2 chunk {chunk_index}/{len(chunks)}: cache hit.")
+                    parsed = self._cache[cache_key]
+                else:
+                    self._log(
+                        on_log,
+                        f"Agent 2 chunk {chunk_index}/{len(chunks)}: sending prompt (~{self._approx_token_count(prompt)} tokens).",
+                    )
+                    response = client.models.generate_content(
+                        model=MODEL_ID,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(temperature=0.1)
+                    )
+
+                    schema_hint = json.dumps(Agent2Response.model_json_schema(), separators=(",", ":"))
+                    parsed = self._parse_with_repair(
+                        response.text or "",
+                        Agent2Response,
+                        schema_hint=schema_hint,
+                        stage_name=f"Agent 2 chunk {chunk_index}/{len(chunks)}",
+                        on_log=on_log,
+                    )
+                    self._cache[cache_key] = parsed
+
+                combined_rules.extend(parsed.mapped_rules)
+                self._log(
+                    on_log,
+                    f"Agent 2 chunk {chunk_index}/{len(chunks)}: mapped {len(parsed.mapped_rules)} rules.",
+                )
+            except Exception as error:
+                self._log(on_log, f"Agent 2 chunk {chunk_index}/{len(chunks)} failed: {error}")
+                return ("ERROR", f"Agent 2 mapping failed in chunk {chunk_index}/{len(chunks)}: {error}")
+
+        result = Agent2Response(mapped_rules=combined_rules)
+        self._log(on_log, f"Agent 2: mapped {len(result.mapped_rules)} rules successfully.")
+        return ("DONE", result)
 
     def agent_2_map_schema_and_values(self, rules: List[Agent1Rule], dataset_columns: List[str], sample_data: str, on_log=None):
         """
@@ -186,15 +309,16 @@ class LLMPipeline:
         Yields string tokens of the raw JSON stream from the LLM. 
         When finished, yields a tuple ("DONE", Agent2Response).
         """
-        # Convert Pydantic rules to dicts to pass in prompt
-        rules_json = json.dumps([r.model_dump() for r in rules], separators=(",", ":"))
+        # Convert Pydantic rules to compact dicts to reduce token usage.
+        rules_json = self._serialize_agent_2_rules(rules)
+        dataset_columns_json = json.dumps(dataset_columns, separators=(",", ":"))
         
         prompt = prompts.AGENT_2_PROMPT.format(
             rules_json=rules_json,
-            dataset_columns=dataset_columns,
+            dataset_columns=dataset_columns_json,
             sample_data=sample_data
         )
-        cache_key = self._cache_key("agent_2_stream", f"{rules_json}|{dataset_columns}|{sample_data}")
+        cache_key = self._cache_key("agent_2_stream", f"{rules_json}|{dataset_columns_json}|{sample_data}")
         
         # We need Agent2Response which wraps the list of rules
         yield from self._generate_and_parse_json(

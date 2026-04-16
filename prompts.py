@@ -12,9 +12,9 @@ JSON schema:
     "rule_id": "Rule 3.1",
     "title": "Large Cash Transaction",
     "description": "Cash transactions >= $10,000 must be flagged for CTR",
-    "severity": "CRITICAL", // CRITICAL | HIGH | MEDIUM | LOW
+    "severity": "CRITICAL",
     "threshold": "$10,000",
-    "logic_type": "threshold", // threshold | velocity | pattern | geographic | duplicate
+    "logic_type": "threshold",
     "sql_query": "SELECT tx_id, timestamp, sender_account, receiver_account, amount, tx_type FROM transactions WHERE tx_type IN ('cash_deposit','cash_withdrawal') AND amount >= 10000",
     "pandas_query": "tx_type in ['cash_deposit','cash_withdrawal'] and amount >= 10000",
     "explanation": "Flags cash transactions >= $10k"
@@ -26,6 +26,8 @@ RULES FOR QUERIES:
 - SQL: SQLite dialect. No placeholders. SELECT must include: tx_id, timestamp, sender_account, receiver_account, amount, tx_type. Return ONLY violating records.
 - Pandas: Generate ONE string to be evaluated inside `df.query()`. Do not use `df[` or variables.
 - Be concise. Keep `description` and `explanation` to one sentence each.
+- `severity` must be one of `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`.
+- `logic_type` must be one of `threshold`, `velocity`, `pattern`, `geographic`, `duplicate`.
 
 POLICY TEXT:
 {policy_text}"""
@@ -51,13 +53,17 @@ OUTPUT raw JSON exactly like this:
       "pandas_query": "method in ['CASH-IN','CASH-OUT'] and trans_amt >= 10000",
       "columns_remapped": ["amount -> trans_amt", "tx_type -> method"],
       "values_remapped": ["cash_deposit -> CASH-IN"],
-      "status": "READY", // MUST be 'READY' if all columns exist, or 'SKIPPED' if a column is missing
-      "skip_reason": "" // Populate if SKIPPED
+      "status": "READY",
+      "skip_reason": ""
     }}
   ]
 }}
 
 Return raw JSON only. No prose, no markdown fences.
+Rules:
+- `status` must be `READY` or `SKIPPED`.
+- Escape any double quotes that appear inside JSON string values.
+- Do not include trailing commas.
 
 GENERIC QUERIES & RULES (From Agent 1):
 {rules_json}
@@ -112,3 +118,15 @@ FINAL LINE:
 
 RAW EXECUTION METRICS:
 {execution_metrics_json}"""
+
+
+JSON_REPAIR_PROMPT = """You are a JSON repair service.
+
+You will receive malformed JSON produced by another model. Repair it so it becomes valid JSON and preserve the original meaning.
+Return JSON only. No prose, no markdown fences.
+
+TARGET SHAPE:
+{schema_hint}
+
+BROKEN JSON:
+{raw_text}"""
