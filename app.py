@@ -185,8 +185,8 @@ if uploaded_policy and st.session_state.raw_df is not None:
         finally:
             append_log("Pipeline run finished.")
 
-def convert_md_to_pdf(md_text):
-    """Convert markdown report to PDF using fpdf2 (pure Python, no native deps)."""
+def convert_md_to_pdf(md_text) -> bytes:
+    """Convert markdown report to PDF and return raw bytes for Streamlit downloads."""
     def pdf_safe(text: str) -> str:
         """
         fpdf's core fonts only support latin-1, so replace unsupported characters
@@ -245,8 +245,21 @@ def convert_md_to_pdf(md_text):
             pdf.ln(3)
         else:
             pdf.multi_cell(0, 6, stripped)
-    
-    return pdf.output()
+
+    # Make the return type explicit and stable across fpdf/pyfpdf variants.
+    try:
+        output = pdf.output(dest="S")
+    except TypeError:
+        output = pdf.output()
+
+    if isinstance(output, bytes):
+        return output
+    if isinstance(output, bytearray):
+        return bytes(output)
+    if isinstance(output, str):
+        return output.encode("latin-1")
+
+    raise TypeError(f"Unexpected PDF output type: {type(output).__name__}")
 
 # --- Main View ---
 
