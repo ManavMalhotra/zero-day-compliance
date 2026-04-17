@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+import textwrap
 from fpdf import FPDF
 
 from llm_pipeline import LLMPipeline
@@ -76,6 +77,7 @@ if uploaded_policy and st.session_state.raw_df is not None:
         st.session_state.agent_2_mapped_rules = []
         st.session_state.final_report = ""
         
+        policy_bytes = uploaded_policy.getvalue()
         policy_text = extract_text_from_file(uploaded_policy)
         executor = PandasExecutor(st.session_state.raw_df)
         schema_info = executor.get_schema_summary()
@@ -99,7 +101,11 @@ if uploaded_policy and st.session_state.raw_df is not None:
             with st.status("🕵️‍♂️ Agent 1: Extracting Rules...", expanded=True) as status1:
                 try:
                     def agent1_streamer():
-                        for chunk in st.session_state.pipeline.agent_1_extract_generic_rules(policy_text, on_log=append_log):
+                        for chunk in st.session_state.pipeline.agent_1_extract_generic_rules(
+                            policy_text,
+                            policy_pdf_bytes=policy_bytes if uploaded_policy.name.lower().endswith(".pdf") else None,
+                            on_log=append_log,
+                        ):
                             if isinstance(chunk, tuple):
                                 st.session_state.agent1_result = chunk
                             else:
@@ -219,6 +225,22 @@ def convert_md_to_pdf(md_text) -> bytes:
 
         return cleaned.encode("latin-1", errors="replace").decode("latin-1")
 
+    def wrap_pdf_text(text: str, width: int):
+        safe_text = pdf_safe(text.replace("\t", " | "))
+        if not safe_text:
+            return [""]
+        return textwrap.wrap(
+            safe_text,
+            width=width,
+            break_long_words=True,
+            break_on_hyphens=False,
+            replace_whitespace=False,
+        ) or [safe_text]
+
+    def render_wrapped_lines(pdf_obj, text: str, line_height: int = 6, width: int = 95):
+        for wrapped in wrap_pdf_text(text, width):
+            pdf_obj.multi_cell(0, line_height, wrapped)
+
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
@@ -239,17 +261,19 @@ def convert_md_to_pdf(md_text) -> bytes:
             pdf.set_font('Helvetica', 'B', 16)
             pdf.multi_cell(0, 10, stripped[2:])
             pdf.set_font('Helvetica', size=10)
-        elif stripped.startswith('|'):
-            # Table rows — render as fixed-width text
-            pdf.set_font('Courier', size=8)
-            pdf.multi_cell(0, 5, stripped)
-            pdf.set_font('Helvetica', size=10)
+        elif stripped.startswith('|') or '\t' in stripped:
+            raw_cells = stripped.split('\t') if '\t' in stripped and '|' not in stripped else stripped.strip('|').split('|')
+            table_cells = [cell.strip() for cell in raw_cells if cell.strip()]
+            if table_cells and not all(set(cell) <= {'-', ':'} for cell in table_cells):
+                pdf.set_font('Courier', size=8)
+                render_wrapped_lines(pdf, " | ".join(table_cells), line_height=5, width=110)
+                pdf.set_font('Helvetica', size=10)
         elif stripped.startswith('```'):
             continue  # Skip code fences
         elif stripped == '':
             pdf.ln(3)
         else:
-            pdf.multi_cell(0, 6, stripped)
+            render_wrapped_lines(pdf, stripped, line_height=6, width=95)
 
     # Make the return type explicit and stable across fpdf/pyfpdf variants.
     try:

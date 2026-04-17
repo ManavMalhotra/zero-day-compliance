@@ -26,10 +26,10 @@ BASE_BACKOFF_SECONDS = 6
 MAX_BACKOFF_SECONDS = 90
 PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 
-PRIMARY_MODEL = os.getenv("GEMINI_MODEL_PRIMARY", "gemini-2.5-flash")
+PRIMARY_MODEL = os.getenv("GEMINI_MODEL_PRIMARY", "gemini-3-flash-preview")
 FALLBACK_MODELS = [
     model.strip()
-    for model in os.getenv("GEMINI_MODEL_FALLBACKS", "gemini-2.5-flash-lite").split(",")
+    for model in os.getenv("GEMINI_MODEL_FALLBACKS", "gemini-2.5-flash,gemini-2.5-flash-lite").split(",")
     if model.strip()
 ]
 
@@ -119,8 +119,16 @@ class LLMPipeline:
         while token_window and now - token_window[0][0] >= 60:
             token_window.popleft()
 
-    def _estimate_input_tokens(self, text: str) -> int:
-        return max(1, len(text) // 4)
+    def _estimate_input_tokens(self, value) -> int:
+        if isinstance(value, str):
+            return max(1, len(value) // 4)
+        if isinstance(value, (list, tuple)):
+            total = 0
+            for item in value:
+                if isinstance(item, str):
+                    total += self._estimate_input_tokens(item)
+            return max(1, total)
+        return 1
 
     def _record_request(self, model: str, input_tokens: int):
         now = time.time()
@@ -227,6 +235,14 @@ class LLMPipeline:
             or "unknown model" in message
         )
 
+    def _is_high_demand_error(self, error: Exception) -> bool:
+        message = str(error).lower()
+        return self._extract_error_code(error) == 503 and (
+            "high demand" in message
+            or "spikes in demand" in message
+            or "currently experiencing high demand" in message
+        )
+
     def _is_daily_quota_exhausted(self, error: Exception) -> bool:
         message = str(error).lower()
         markers = (
@@ -280,8 +296,8 @@ class LLMPipeline:
         jitter = random.uniform(0.0, 1.0)
         return min(MAX_BACKOFF_SECONDS, base_delay + jitter)
 
-    def _call_with_retries(self, stage_name: str, prompt: str, schema_hint: Optional[dict], temperature: float, on_log=None):
-        prompt_tokens = self._estimate_input_tokens(prompt)
+    def _call_with_retries(self, stage_name: str, contents, schema_hint: Optional[dict], temperature: float, on_log=None):
+        prompt_tokens = self._estimate_input_tokens(contents)
         last_error = None
         models = self._model_candidates()
 
@@ -296,11 +312,18 @@ class LLMPipeline:
                     )
                     return client.models.generate_content(
                         model=model,
-                        contents=prompt,
+                        contents=contents,
                         config=self._build_generation_config(schema_hint, temperature),
                     )
                 except Exception as error:
                     last_error = error
+                    if self._is_high_demand_error(error):
+                        self._log(
+                            on_log,
+                            f"{stage_name}: {model} is under high demand ({error}). Switching to the next model immediately.",
+                        )
+                        break
+
                     if self._is_model_unavailable(error):
                         self._log(on_log, f"{stage_name}: {model} is unavailable ({error}). Trying fallback model.")
                         break
@@ -326,8 +349,8 @@ class LLMPipeline:
 
         raise last_error if last_error else RuntimeError(f"{stage_name}: all Gemini models failed.")
 
-    def _stream_text_with_retries(self, stage_name: str, prompt: str, schema_hint: Optional[dict], temperature: float, on_log=None):
-        prompt_tokens = self._estimate_input_tokens(prompt)
+    def _stream_text_with_retries(self, stage_name: str, contents, schema_hint: Optional[dict], temperature: float, on_log=None):
+        prompt_tokens = self._estimate_input_tokens(contents)
         last_error = None
         models = self._model_candidates()
 
@@ -343,7 +366,7 @@ class LLMPipeline:
                     )
                     response_stream = client.models.generate_content_stream(
                         model=model,
-                        contents=prompt,
+                        contents=contents,
                         config=self._build_generation_config(schema_hint, temperature),
                     )
                     for chunk in response_stream:
@@ -358,6 +381,13 @@ class LLMPipeline:
                     if emitted_any:
                         self._log(on_log, f"{stage_name}: stream failed after partial output on {model} ({error}).")
                         raise
+
+                    if self._is_high_demand_error(error):
+                        self._log(
+                            on_log,
+                            f"{stage_name}: {model} is under high demand ({error}). Switching to the next model immediately.",
+                        )
+                        break
 
                     if self._is_model_unavailable(error):
                         self._log(on_log, f"{stage_name}: {model} is unavailable ({error}). Trying fallback model.")
@@ -462,7 +492,7 @@ class LLMPipeline:
         schema_dict = json.loads(schema_hint)
         response = self._call_with_retries(
             stage_name=f"{stage_name} repair",
-            prompt=repair_prompt,
+            contents=repair_prompt,
             schema_hint=schema_dict,
             temperature=0,
             on_log=on_log,
@@ -498,7 +528,7 @@ class LLMPipeline:
         for index in range(0, len(rules), chunk_size):
             yield rules[index:index + chunk_size]
 
-    def _generate_and_parse_json(self, prompt: str, pydantic_model, stage_name: str, on_log=None, cache_key: Optional[str] = None):
+    def _generate_and_parse_json(self, contents, prompt_preview: str, pydantic_model, stage_name: str, on_log=None, cache_key: Optional[str] = None):
         if cache_key and cache_key in self._cache:
             self._log(on_log, f"{stage_name}: cache hit.")
             yield ("DONE", self._cache[cache_key])
@@ -508,12 +538,12 @@ class LLMPipeline:
         if stage_name == "Agent 1":
             base_schema_hint = {"type": "array", "items": base_schema_hint}
 
-        self._log(on_log, f"{stage_name}: sending prompt (~{self._approx_token_count(prompt)} tokens).")
+        self._log(on_log, f"{stage_name}: sending prompt (~{self._approx_token_count(prompt_preview)} tokens).")
         full_text = ""
         next_progress_mark = 600
         for text in self._stream_text_with_retries(
             stage_name=stage_name,
-            prompt=prompt,
+            contents=contents,
             schema_hint=base_schema_hint,
             temperature=0.1,
             on_log=on_log,
@@ -544,19 +574,32 @@ class LLMPipeline:
             self._log(on_log, f"{stage_name}: schema validation failed.")
             yield ("ERROR", f"JSON Parse/Validation failed: {error}\n\nRAW OUTPUT:\n{full_text}")
 
-    def agent_1_extract_generic_rules(self, policy_text: str, on_log=None):
+    def agent_1_extract_generic_rules(self, policy_text: str, policy_pdf_bytes: bytes | None = None, on_log=None):
         """
         Agent 1 (Policy Interpreter) Generator:
         Yields string tokens of the raw JSON stream from the LLM.
         When finished, yields a tuple ("DONE", List[Agent1Rule]).
         """
-        self._log(
-            on_log,
-            f"Agent 1: sending full policy context ({len(policy_text):,} characters, no pruning).",
-        )
-        prompt = prompts.AGENT_1_PROMPT.format(policy_text=policy_text)
-        cache_key = self._cache_key("agent_1", policy_text)
+        using_pdf = policy_pdf_bytes is not None
+        if using_pdf:
+            self._log(on_log, "Agent 1: using Gemini native PDF understanding on the uploaded document.")
+            policy_source = "[Use the attached PDF document as the authoritative policy source.]"
+        else:
+            self._log(
+                on_log,
+                f"Agent 1: sending full policy context ({len(policy_text):,} characters, no pruning).",
+            )
+            policy_source = policy_text
+
+        prompt = prompts.AGENT_1_PROMPT.format(policy_text=policy_source)
+        contents = [prompt]
+        if using_pdf:
+            contents.append(types.Part.from_bytes(data=policy_pdf_bytes, mime_type="application/pdf"))
+
+        cache_material = policy_text if not using_pdf else f"{policy_text}|{hashlib_sha256(policy_pdf_bytes.hex())}"
+        cache_key = self._cache_key("agent_1", cache_material)
         yield from self._generate_and_parse_json(
+            contents,
             prompt,
             Agent1Rule,
             stage_name="Agent 1",
@@ -601,7 +644,7 @@ class LLMPipeline:
                     )
                     response = self._call_with_retries(
                         stage_name=f"Agent 2 chunk {chunk_index}/{len(chunks)}",
-                        prompt=prompt,
+                        contents=prompt,
                         schema_hint=Agent2Response.model_json_schema(),
                         temperature=0.1,
                         on_log=on_log,
@@ -648,6 +691,7 @@ class LLMPipeline:
 
         yield from self._generate_and_parse_json(
             prompt,
+            prompt,
             Agent2Response,
             stage_name="Agent 2",
             on_log=on_log,
@@ -672,7 +716,7 @@ class LLMPipeline:
         next_progress_mark = 800
         for text in self._stream_text_with_retries(
             stage_name="Agent 3",
-            prompt=prompt,
+            contents=prompt,
             schema_hint=None,
             temperature=0.2,
             on_log=on_log,

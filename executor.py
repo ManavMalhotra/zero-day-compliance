@@ -1,241 +1,325 @@
-import pandas as pd
 import json
+import re
+
+import pandas as pd
+
+from utils import canonicalize_name
+
 
 class PandasExecutor:
-    """Safely executes dynamically mapped Pandas queries against a loaded DataFrame."""
-    
+    """Executes mapped Pandas rules against a loaded DataFrame with controlled fallbacks."""
+
     def __init__(self, df: pd.DataFrame):
-        self.df = df
-        
-        # Auto-fix common issues Agent 3 identified
+        self.df = df.copy()
+        self._canonical_columns = {canonicalize_name(column): column for column in self.df.columns}
         self._auto_fix_dtypes()
-
-    def _auto_fix_dtypes(self):
-        """Silently cast common columns to correct types for easier Pandas querying using sampling."""
-        # Lowercase all actual columns to find standard ones
-        cols_lower = {c.lower(): c for c in self.df.columns}
-        
-        # Auto-cast known timestamp columns based on 100-row sample
-        for t_col in ['timestamp', 'date', 'time', 'trans_date', 'transaction_date']:
-            if t_col in cols_lower:
-                real_col = cols_lower[t_col]
-                if self.df[real_col].dtype == 'object':
-                    sample = self.df[real_col].dropna().head(100)
-                    if len(sample) > 0 and sample.astype(str).str.match(r'^\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4}').all():
-                        try:
-                            self.df[real_col] = pd.to_datetime(self.df[real_col], errors='coerce')
-                        except (ValueError, TypeError) as e:
-                            print(f"[Warning] Failed to auto-cast {real_col} to datetime: {e}")
-        
-        # Auto-cast known amount columns based on 100-row sample
-        for a_col in ['amount', 'trans_amt', 'value', 'usd_amount', 'amount_paid']:
-            if a_col in cols_lower:
-                real_col = cols_lower[a_col]
-                if self.df[real_col].dtype == 'object':
-                    sample = self.df[real_col].dropna().head(100)
-                    if len(sample) > 0 and sample.astype(str).str.match(r'^[\$,]?\s*\d+(?:,\d{3})*(?:\.\d+)?$').all():
-                        try:
-                            self.df[real_col] = self.df[real_col].replace(r'[\$,]', '', regex=True).astype(float)
-                        except (ValueError, TypeError) as e:
-                            print(f"[Warning] Failed to auto-cast {real_col} to float: {e}")
-
-        # Pre-compute Global Schema Mappings for N+1 Metrics Calculation
-        self.amount_col = None
-        self.date_col = None
-        self.account_col = None
-
-        for c in self.df.columns:
-            lower_c = c.lower()
-            if 'amount' in lower_c or 'value' in lower_c or 'amt' in lower_c:
-                self.amount_col = c
-                break
-                
-        for c in self.df.columns:
-            lower_c = c.lower()
-            if 'date' in lower_c or 'time' in lower_c or 'timestamp' in lower_c:
-                self.date_col = c
-                break
-                
-        for c in self.df.columns:
-            lower_c = c.lower()
-            if 'account' in lower_c or 'acct' in lower_c or 'id' in lower_c:
-                self.account_col = c
-                break
-
-    def get_schema_summary(self):
-        """Returns standard headers and 5 sample values for Agent 2 to use in mapping."""
-        return {
-            "columns": list(self.df.columns),
-            "sample_csv": json.dumps({
-                col: self.df[col].dropna().unique()[:5].tolist()
-                for col in self.df.columns
-            }, default=str)
-        }
+        self.amount_col = self._find_best_column(["amount_paid", "amount_received", "amount", "value", "amt"])
+        self.date_col = self._find_best_column(["timestamp", "date", "time", "transaction_date", "trans_date"])
+        self.account_col = self._find_best_column(["from_account", "sender_account", "account", "acct", "account_id"])
 
     def _log(self, on_log, message: str):
         if on_log:
             on_log(message)
 
+    def _find_best_column(self, candidates):
+        for candidate in candidates:
+            canonical = canonicalize_name(candidate)
+            if canonical in self._canonical_columns:
+                return self._canonical_columns[canonical]
+
+        for canonical, actual in self._canonical_columns.items():
+            if any(token in canonical for token in candidates):
+                return actual
+        return None
+
+    def _series_looks_numeric(self, series: pd.Series) -> bool:
+        sample = series.dropna().astype(str).head(100)
+        if sample.empty:
+            return False
+        cleaned = sample.str.replace(r"[\$,]", "", regex=True).str.strip()
+        return cleaned.str.match(r"^-?\d+(?:\.\d+)?$").all()
+
+    def _series_looks_datetime(self, series: pd.Series) -> bool:
+        sample = series.dropna().astype(str).head(100)
+        if sample.empty:
+            return False
+        return sample.str.match(r"^\d{4}[-/]\d{2}[-/]\d{2}").all()
+
+    def _auto_fix_dtypes(self):
+        """Casts likely numeric and datetime columns even when names contain spaces/punctuation."""
+        for column in self.df.columns:
+            canonical = canonicalize_name(column)
+            series = self.df[column]
+
+            if series.dtype != "object":
+                continue
+
+            if any(token in canonical for token in ["timestamp", "date", "time"]) and self._series_looks_datetime(series):
+                self.df[column] = pd.to_datetime(series, errors="coerce")
+                continue
+
+            if any(token in canonical for token in ["amount", "value", "amt"]) and self._series_looks_numeric(series):
+                cleaned = series.astype(str).str.replace(r"[\$,]", "", regex=True).str.strip()
+                self.df[column] = pd.to_numeric(cleaned, errors="coerce")
+
+    def get_schema_summary(self):
+        return {
+            "columns": list(self.df.columns),
+            "sample_csv": json.dumps(
+                {column: self.df[column].dropna().unique()[:5].tolist() for column in self.df.columns},
+                default=str,
+            ),
+        }
+
+    def _normalize_query_text(self, query: str) -> str:
+        cleaned = str(query or "").strip()
+        cleaned = cleaned.strip("`") if cleaned.startswith("```") else cleaned
+        cleaned = cleaned.replace("transactions", "df")
+        return cleaned
+
+    def _is_unsafe_expression(self, expression: str) -> bool:
+        lowered = expression.lower()
+        blocked_markers = [
+            "__",
+            "import ",
+            "open(",
+            "exec(",
+            "eval(",
+            "compile(",
+            "globals(",
+            "locals(",
+            "subprocess",
+            "os.",
+            "sys.",
+        ]
+        return any(marker in lowered for marker in blocked_markers)
+
+    def _result_to_dataframe(self, result):
+        if isinstance(result, pd.DataFrame):
+            return result
+
+        if isinstance(result, pd.Series):
+            if result.dtype == bool:
+                return self.df.loc[result.fillna(False)]
+            return self.df.loc[result.index]
+
+        if isinstance(result, pd.Index):
+            return self.df.loc[result]
+
+        if isinstance(result, (list, tuple, set)):
+            return self.df.loc[list(result)]
+
+        raise TypeError(f"Unsupported Pandas execution result: {type(result).__name__}")
+
+    def _execute_query_expression(self, expression: str):
+        if expression.startswith(("df.", "df[", "pd.", "(")):
+            allowed_builtins = {"len": len, "abs": abs, "min": min, "max": max, "sum": sum, "round": round}
+            scope = {"df": self.df, "pd": pd}
+            result = eval(expression, {"__builtins__": allowed_builtins}, scope)
+            return self._result_to_dataframe(result)
+
+        return self.df.query(expression, engine="python")
+
     def execute_mapped_query(self, mapped_query: str, on_log=None):
         """
-        Executes mapped Pandas query strings with DataFrame.query(), which matches
-        the syntax required in the prompts and supports backtick-escaped columns.
+        Executes either:
+        - a row filter expression for df.query(), or
+        - a full pandas expression returning a DataFrame / mask / indices.
         """
         try:
             if not mapped_query or str(mapped_query).strip() == "":
-                 return {"success": False, "error": "Empty query string."}
+                return {"success": False, "error": "Empty query string."}
 
-            filtered_df = self.df.query(mapped_query, engine="python")
+            expression = self._normalize_query_text(mapped_query)
+            if self._is_unsafe_expression(expression):
+                raise ValueError("Blocked unsafe pandas expression.")
+
+            filtered_df = self._execute_query_expression(expression)
             violation_count = len(filtered_df)
 
             if violation_count > 0:
                 sample_df = filtered_df.head(5).copy()
                 violation_indices = filtered_df.index
             else:
-                sample_df = pd.DataFrame()
+                sample_df = pd.DataFrame(columns=self.df.columns)
                 violation_indices = pd.Index([])
 
             self._log(on_log, f"Query executed successfully. Matched {violation_count} rows.")
-            
             return {
                 "success": True,
                 "violation_count": int(violation_count),
                 "violating_indices": violation_indices,
-                "sample_df": sample_df
+                "violating_df": filtered_df,
+                "sample_df": sample_df,
             }
-        except Exception as e:
-            self._log(on_log, f"Query execution failed: {e}")
-            return {"success": False, "error": str(e)}
+        except Exception as error:
+            self._log(on_log, f"Query execution failed: {error}")
+            return {"success": False, "error": str(error)}
+
+    def _extract_rule_targets(self, rule):
+        mapped_cols = rule.get("columns_remapped", [])
+        rule_amount_col = None
+        rule_date_col = None
+        rule_account_col = None
+
+        for mapping in mapped_cols:
+            if "->" not in mapping:
+                continue
+            generic, actual = mapping.split("->", 1)
+            generic = canonicalize_name(generic)
+            actual = actual.strip()
+            if generic in {"amount", "trans_amt", "value"}:
+                rule_amount_col = actual
+            elif generic in {"timestamp", "date", "time"}:
+                rule_date_col = actual
+            elif generic in {"sender_account", "account", "from_acct"}:
+                rule_account_col = actual
+
+        return (
+            rule_amount_col or self.amount_col,
+            rule_date_col or self.date_col,
+            rule_account_col or self.account_col,
+        )
 
     def run_all_rules_and_collect_metrics(self, rules_from_agent2, on_log=None):
-        """Runs Agent 3's execution loop and compiles the metric dictionary for reporting."""
         metrics = []
-        
+
         for rule in rules_from_agent2:
-            # If Agent 2 skipped it because of missing columns
-            if rule['status'] != 'READY' or not rule['pandas_query']:
+            if rule["status"] != "READY" or not rule.get("pandas_query"):
+                skip_reason = rule.get("skip_reason", "Missing columns or unsupported mapping.")
                 self._log(on_log, f"Skipping {rule['rule_id']} - {rule['title']} because Agent 2 marked it as {rule['status']}.")
-                metrics.append({
-                    "rule_id": rule['rule_id'],
-                    "title": rule['title'],
-                    "severity": rule['severity'],
-                    "status": "SKIPPED",
-                    "violation_count": 0,
-                    "total_amount_exposure": 0,
-                    "sql_query": rule.get('sql_query', ''),
-                    "pandas_query": rule.get('pandas_query', '')
-                })
+                metrics.append(
+                    {
+                        "rule_id": rule["rule_id"],
+                        "title": rule["title"],
+                        "severity": rule["severity"],
+                        "status": "SKIPPED",
+                        "skip_reason": skip_reason,
+                        "violation_count": 0,
+                        "unique_accounts": 0,
+                        "total_amount_exposure": 0.0,
+                        "avg_amount": 0.0,
+                        "date_range": "N/A",
+                        "top_offenders": [],
+                        "risk_score": {"CRITICAL": 8, "HIGH": 5, "MEDIUM": 3, "LOW": 1}.get(rule["severity"].upper(), 1),
+                        "sql_query": rule.get("sql_query", ""),
+                        "pandas_query": rule.get("pandas_query", ""),
+                    }
+                )
                 continue
-                
+
             self._log(on_log, f"Executing {rule['rule_id']} - {rule['title']}.")
-            result = self.execute_mapped_query(rule['pandas_query'], on_log=on_log)
-            
+            result = self.execute_mapped_query(rule["pandas_query"], on_log=on_log)
+
             if not result["success"]:
-                 self._log(on_log, f"{rule['rule_id']} failed: {result['error']}")
-                 metrics.append({
-                    "rule_id": rule['rule_id'],
-                    "title": rule['title'],
-                    "severity": rule['severity'],
-                    "status": "ERROR: " + result["error"],
-                    "violation_count": 0,
-                    "total_amount_exposure": 0
-                })
-            else:
-                count = result["violation_count"]
-                self._log(on_log, f"{rule['rule_id']} completed with {count} matched rows.")
-                
-                # Default generic metrics
-                unique_accounts = 0
-                total_exposure = 0
-                avg_amount = 0
-                date_range = "N/A"
-                top_offenders = []
-                
-                # Dynamically extract Agent 2's exact mappings for this specific rule
-                mapped_cols = rule.get('columns_remapped', [])
-                rule_amount_col = None
-                rule_date_col = None
-                rule_account_col = None
-                
-                for mapping in mapped_cols:
-                    if '->' in mapping:
-                        generic, actual = mapping.split('->')
-                        generic, actual = generic.strip().lower(), actual.strip()
-                        if generic in ['amount', 'trans_amt', 'value']:
-                            rule_amount_col = actual
-                        elif generic in ['timestamp', 'date', 'time']:
-                            rule_date_col = actual
-                        elif generic in ['sender_account', 'account', 'from_acct']:
-                            rule_account_col = actual
-                
-                if count > 0:
-                    indices = result["violating_indices"]
-                    sample_df = result["sample_df"]
-                    
-                    # Compute aggregations using the exact row indices on the actual mapped columns
-                    target_amount_col = rule_amount_col or self.amount_col
-                    target_date_col = rule_date_col or self.date_col
-                    target_account_col = rule_account_col or self.account_col
+                error_message = result["error"]
+                self._log(on_log, f"{rule['rule_id']} failed: {error_message}")
+                metrics.append(
+                    {
+                        "rule_id": rule["rule_id"],
+                        "title": rule["title"],
+                        "severity": rule["severity"],
+                        "status": "ERROR",
+                        "error_message": error_message,
+                        "violation_count": 0,
+                        "unique_accounts": 0,
+                        "total_amount_exposure": 0.0,
+                        "avg_amount": 0.0,
+                        "date_range": "N/A",
+                        "top_offenders": [],
+                        "risk_score": {"CRITICAL": 8, "HIGH": 5, "MEDIUM": 3, "LOW": 1}.get(rule["severity"].upper(), 1),
+                        "sql_query": rule.get("sql_query", ""),
+                        "pandas_query": rule.get("pandas_query", ""),
+                    }
+                )
+                continue
 
-                    if target_amount_col and target_amount_col in self.df.columns:
-                        try:
-                            amounts = pd.to_numeric(self.df.loc[indices, target_amount_col], errors='coerce').fillna(0)
-                            total_exposure = amounts.sum()
-                            avg_amount = amounts.mean()
-                        except Exception as e:
-                            self._log(on_log, f"Warning: failed amount aggregation for {target_amount_col}: {e}")
-                            
-                    if target_date_col and target_date_col in self.df.columns:
-                        try:
-                            dates = pd.to_datetime(self.df.loc[indices, target_date_col], errors='coerce').dropna()
-                            if not dates.empty:
-                                date_range = f"{dates.min().strftime('%Y-%m-%d %H:%M')} to {dates.max().strftime('%Y-%m-%d %H:%M')}"
-                        except Exception as e:
-                            self._log(on_log, f"Warning: failed date aggregation for {target_date_col}: {e}")
-                            
-                    if target_account_col and target_account_col in self.df.columns:
-                        try:
-                            accounts = self.df.loc[indices, target_account_col]
-                            unique_accounts = accounts.nunique()
-                            top_3 = accounts.value_counts().head(3)
-                            top_offenders = [f"{acct} ({val} txns)" for acct, val in top_3.items()]
-                        except Exception as e:
-                            self._log(on_log, f"Warning: failed offender aggregation for {target_account_col}: {e}")
-                
-                # Risk Score (1-10)
-                base_scores = {"CRITICAL": 8, "HIGH": 5, "MEDIUM": 3, "LOW": 1}
-                risk_score = base_scores.get(rule['severity'].upper(), 1)
-                
-                if count > (len(self.df) * 0.1): # > 10% of total rows
-                    risk_score += 1
-                if float(total_exposure) > 1000000:
-                    risk_score += 1
-                    
-                risk_score = min(score for score in [risk_score, 10]) # Cap at 10
+            count = result["violation_count"]
+            self._log(on_log, f"{rule['rule_id']} completed with {count} matched rows.")
 
-                metrics.append({
-                    "rule_id": rule['rule_id'],
-                    "title": rule['title'],
-                    "severity": rule['severity'],
+            unique_accounts = 0
+            total_exposure = 0.0
+            avg_amount = 0.0
+            date_range = "N/A"
+            top_offenders = []
+            sample_df = result["sample_df"]
+            violating_df = result["violating_df"]
+            indices = result["violating_indices"]
+            target_amount_col, target_date_col, target_account_col = self._extract_rule_targets(rule)
+
+            if count > 0:
+                if target_amount_col and (target_amount_col in violating_df.columns or target_amount_col in self.df.columns):
+                    try:
+                        source_amounts = violating_df[target_amount_col] if target_amount_col in violating_df.columns else self.df.loc[indices, target_amount_col]
+                        amounts = pd.to_numeric(source_amounts, errors="coerce").fillna(0)
+                        total_exposure = float(amounts.sum())
+                        avg_amount = float(amounts.mean())
+                    except Exception as error:
+                        self._log(on_log, f"Warning: failed amount aggregation for {target_amount_col}: {error}")
+
+                if target_date_col and (target_date_col in violating_df.columns or target_date_col in self.df.columns):
+                    try:
+                        source_dates = violating_df[target_date_col] if target_date_col in violating_df.columns else self.df.loc[indices, target_date_col]
+                        dates = pd.to_datetime(source_dates, errors="coerce").dropna()
+                        if not dates.empty:
+                            date_range = f"{dates.min().strftime('%Y-%m-%d %H:%M')} to {dates.max().strftime('%Y-%m-%d %H:%M')}"
+                    except Exception as error:
+                        self._log(on_log, f"Warning: failed date aggregation for {target_date_col}: {error}")
+
+                if target_account_col and (target_account_col in violating_df.columns or target_account_col in self.df.columns):
+                    try:
+                        accounts = violating_df[target_account_col] if target_account_col in violating_df.columns else self.df.loc[indices, target_account_col]
+                        unique_accounts = int(accounts.nunique())
+                        top_3 = accounts.astype(str).value_counts().head(3)
+                        top_offenders = [f"{acct} ({value} rows)" for acct, value in top_3.items()]
+                    except Exception as error:
+                        self._log(on_log, f"Warning: failed offender aggregation for {target_account_col}: {error}")
+
+            base_scores = {"CRITICAL": 8, "HIGH": 5, "MEDIUM": 3, "LOW": 1}
+            risk_score = base_scores.get(rule["severity"].upper(), 1)
+            if count > (len(self.df) * 0.1):
+                risk_score += 1
+            if total_exposure > 1_000_000:
+                risk_score += 1
+            risk_score = min(risk_score, 10)
+
+            metrics.append(
+                {
+                    "rule_id": rule["rule_id"],
+                    "title": rule["title"],
+                    "severity": rule["severity"],
                     "status": "FLAGGED" if count > 0 else "CLEAN",
-                    "risk_score": risk_score,
                     "violation_count": count,
-                    "unique_accounts": int(unique_accounts),
-                    "total_amount_exposure": float(total_exposure),
-                    "avg_amount": float(avg_amount),
+                    "unique_accounts": unique_accounts,
+                    "total_amount_exposure": total_exposure,
+                    "avg_amount": avg_amount,
                     "date_range": date_range,
                     "top_offenders": top_offenders,
-                    "sql_query": rule.get('sql_query', ''),
-                    "pandas_query": rule.get('pandas_query', ''),
-                    "sample_offending_row": sample_df.to_dict(orient="records") if count > 0 else []
-                })
-                self._log(on_log, f"{rule['rule_id']} metrics ready. Risk score {risk_score}/10, exposure {float(total_exposure):,.2f}.")
-                
-        # Strip bulky sample rows before sending to LLM — Agent 3 only needs aggregated metrics
-        lean_metrics = []
-        for m in metrics:
-            lean = {k: v for k, v in m.items() if k != 'sample_offending_row'}
-            lean_metrics.append(lean)
+                    "risk_score": risk_score,
+                    "sql_query": rule.get("sql_query", ""),
+                    "pandas_query": rule.get("pandas_query", ""),
+                    "sample_offending_row": sample_df.to_dict(orient="records") if count > 0 else [],
+                }
+            )
+            self._log(on_log, f"{rule['rule_id']} metrics ready. Risk score {risk_score}/10, exposure {total_exposure:,.2f}.")
 
-        self._log(on_log, f"Prepared execution metrics for {len(lean_metrics)} rules.")
-        return json.dumps(lean_metrics, separators=(',', ':'), default=str)
+        summary = {
+            "total_rules": len(metrics),
+            "executed_rules": sum(1 for metric in metrics if metric["status"] in {"FLAGGED", "CLEAN"}),
+            "flagged_rules": sum(1 for metric in metrics if metric["status"] == "FLAGGED"),
+            "clean_rules": sum(1 for metric in metrics if metric["status"] == "CLEAN"),
+            "skipped_rules": sum(1 for metric in metrics if metric["status"] == "SKIPPED"),
+            "error_rules": sum(1 for metric in metrics if metric["status"] == "ERROR"),
+            "total_confirmed_exposure": float(sum(metric.get("total_amount_exposure", 0.0) for metric in metrics if metric["status"] == "FLAGGED")),
+        }
+        summary["coverage_pct"] = round(
+            (summary["executed_rules"] / summary["total_rules"]) * 100, 2
+        ) if summary["total_rules"] else 0.0
+
+        lean_metrics = []
+        for metric in metrics:
+            lean_metrics.append({key: value for key, value in metric.items() if key != "sample_offending_row"})
+
+        payload = {"summary": summary, "rules": lean_metrics}
+        self._log(on_log, f"Prepared execution metrics for {len(lean_metrics)} rules. Coverage {summary['coverage_pct']}%.")
+        return json.dumps(payload, separators=(",", ":"), default=str)

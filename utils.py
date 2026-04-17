@@ -3,15 +3,22 @@ import re
 
 import PyPDF2
 
+
+def canonicalize_name(name: str) -> str:
+    """Normalizes names so spaces, punctuation, and casing do not break matching."""
+    return re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
+
 def extract_text_from_file(uploaded_file) -> str:
     """Safely extracts text from uploaded PDF or TXT files."""
     if uploaded_file.name.endswith('.pdf'):
         pdf_reader = PyPDF2.PdfReader(uploaded_file)
-        text = ""
+        pages = []
         for i, page in enumerate(pdf_reader.pages):
             extracted = page.extract_text()
             if extracted:
-                text += extracted + "\n"
+                page_text = normalize_whitespace(extracted)
+                pages.append(f"[Page {i + 1}]\n{page_text}")
+        text = "\n\n".join(pages)
                 
         if not text.strip():
             raise ValueError(f"No extractable text found in '{uploaded_file.name}'. Is it a scanned document? Standard text-based PDFs are required.")
@@ -104,7 +111,9 @@ def build_schema_context(df, max_examples: int = 3, max_columns: int = 40) -> st
         examples = series.dropna().astype(str).unique()[:max_examples].tolist()
         profiles.append({
             "name": column,
+            "normalized_name": canonicalize_name(column),
             "dtype": str(series.dtype),
+            "null_count": int(series.isna().sum()),
             "examples": examples,
         })
 
