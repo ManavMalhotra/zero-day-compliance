@@ -75,6 +75,12 @@ class PandasExecutor:
         cleaned = str(query or "").strip()
         cleaned = cleaned.strip("`") if cleaned.startswith("```") else cleaned
         cleaned = cleaned.replace("transactions", "df")
+        # Free models often emit unicode comparison operators.
+        cleaned = cleaned.replace("\u2265", ">=")  # ≥
+        cleaned = cleaned.replace("\u2264", "<=")   # ≤
+        cleaned = cleaned.replace("\u2260", "!=")   # ≠
+        cleaned = cleaned.replace("\u2013", "-")    # en-dash
+        cleaned = cleaned.replace("\u2014", "-")    # em-dash
         return cleaned
 
     def _is_unsafe_expression(self, expression: str) -> bool:
@@ -111,14 +117,30 @@ class PandasExecutor:
 
         raise TypeError(f"Unsupported Pandas execution result: {type(result).__name__}")
 
+    def _prepare_df_for_execution(self):
+        """Returns a copy of df with DatetimeIndex if a datetime column exists, enabling rolling('24h')."""
+        exec_df = self.df
+        if self.date_col and self.date_col in exec_df.columns:
+            if pd.api.types.is_datetime64_any_dtype(exec_df[self.date_col]):
+                exec_df = exec_df.sort_values(self.date_col).set_index(self.date_col, drop=False)
+        return exec_df
+
     def _execute_query_expression(self, expression: str):
+        import numpy as np
+        exec_df = self._prepare_df_for_execution()
+        scope = {
+            "df": exec_df,
+            "transactions": exec_df,
+            "pd": pd,
+            "np": np,
+        }
+        allowed_builtins = {"len": len, "abs": abs, "min": min, "max": max, "sum": sum, "round": round}
+
         if expression.startswith(("df.", "df[", "pd.", "(")):
-            allowed_builtins = {"len": len, "abs": abs, "min": min, "max": max, "sum": sum, "round": round}
-            scope = {"df": self.df, "pd": pd}
             result = eval(expression, {"__builtins__": allowed_builtins}, scope)
             return self._result_to_dataframe(result)
 
-        return self.df.query(expression, engine="python")
+        return exec_df.query(expression, engine="python", local_dict={"pd": pd, "np": np})
 
     def execute_mapped_query(self, mapped_query: str, on_log=None):
         """
