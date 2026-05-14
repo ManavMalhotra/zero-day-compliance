@@ -10,15 +10,17 @@ from typing import List, Optional
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from openai import OpenAI
 from pydantic import BaseModel, Field
 
 import prompts
 
 load_dotenv()
 
-client = genai.Client()
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY", ""),
+)
 
 AGENT_2_BATCH_SIZE = 4
 MAX_API_ATTEMPTS = 4
@@ -26,19 +28,18 @@ BASE_BACKOFF_SECONDS = 6
 MAX_BACKOFF_SECONDS = 90
 PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 
-PRIMARY_MODEL = os.getenv("GEMINI_MODEL_PRIMARY", "gemini-3-flash-preview")
+PRIMARY_MODEL = os.getenv("OPENROUTER_MODEL_NEMATRON", "deepseek/deepseek-v4-flash:free")
 FALLBACK_MODELS = [
     model.strip()
-    for model in os.getenv("GEMINI_MODEL_FALLBACKS", "gemini-2.5-flash,gemini-2.5-flash-lite").split(",")
+    for model in os.getenv("OPENROUTER_MODEL_FALLBACKS", "google/gemma-4-26b-a4b-it:free,nvidia/nemotron-3-super-120b-a12b:free").split(",")
     if model.strip()
 ]
 
-# Based on Gemini API free-tier limits from the official docs.
+# Based on OpenRouter free-tier limits.
 FREE_TIER_LIMITS = {
-    "gemini-2.5-flash": {"rpm": 10, "tpm": 250_000, "rpd": 250},
-    "gemini-2.5-flash-lite": {"rpm": 15, "tpm": 250_000, "rpd": 1_000},
-    "gemini-2.0-flash": {"rpm": 15, "tpm": 1_000_000, "rpd": 200},
-    "gemini-2.0-flash-lite": {"rpm": 30, "tpm": 1_000_000, "rpd": 200},
+    "deepseek/deepseek-v4-flash:free": {"rpm": 20, "tpm": 500_000, "rpd": 200},
+    "nvidia/nemotron-3-super-120b-a12b:free": {"rpm": 20, "tpm": 500_000, "rpd": 200},
+    "google/gemma-4-26b-a4b-it:free": {"rpm": 20, "tpm": 500_000, "rpd": 200},
 }
 
 
@@ -182,42 +183,11 @@ class LLMPipeline:
             )
             time.sleep(wait_time)
 
-    def _json_schema_with_ordering(self, schema: dict) -> dict:
-        """Adds propertyOrdering recursively for Gemini structured outputs, including 2.0 models."""
-        ordered_schema = deepcopy(schema)
-
-        def add_ordering(node):
-            if not isinstance(node, dict):
-                return
-
-            properties = node.get("properties")
-            if node.get("type") == "object" and isinstance(properties, dict):
-                node.setdefault("propertyOrdering", list(properties.keys()))
-                for child in properties.values():
-                    add_ordering(child)
-
-            items = node.get("items")
-            if isinstance(items, dict):
-                add_ordering(items)
-            elif isinstance(items, list):
-                for child in items:
-                    add_ordering(child)
-
-            for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
-                value = node.get(key)
-                if isinstance(value, list):
-                    for child in value:
-                        add_ordering(child)
-
-        add_ordering(ordered_schema)
-        return ordered_schema
-
-    def _build_generation_config(self, schema_hint: Optional[dict], temperature: float):
-        config = {"temperature": temperature}
+    def _build_response_format(self, schema_hint: Optional[dict]):
+        """Builds response_format for OpenRouter. Uses json_object mode for structured output."""
         if schema_hint is not None:
-            config["response_mime_type"] = "application/json"
-            config["response_json_schema"] = self._json_schema_with_ordering(schema_hint)
-        return types.GenerateContentConfig(**config)
+            return {"type": "json_object"}
+        return None
 
     def _extract_error_code(self, error: Exception) -> Optional[int]:
         for attr in ("code", "status_code", "http_status"):
@@ -296,6 +266,15 @@ class LLMPipeline:
         jitter = random.uniform(0.0, 1.0)
         return min(MAX_BACKOFF_SECONDS, base_delay + jitter)
 
+    def _contents_to_messages(self, contents):
+        """Converts contents (string or list of strings) to OpenAI messages format."""
+        if isinstance(contents, str):
+            return [{"role": "user", "content": contents}]
+        if isinstance(contents, list):
+            text_parts = [part for part in contents if isinstance(part, str)]
+            return [{"role": "user", "content": "\n\n".join(text_parts)}]
+        return [{"role": "user", "content": str(contents)}]
+
     def _call_with_retries(self, stage_name: str, contents, schema_hint: Optional[dict], temperature: float, on_log=None):
         prompt_tokens = self._estimate_input_tokens(contents)
         last_error = None
@@ -310,11 +289,16 @@ class LLMPipeline:
                         on_log,
                         f"{stage_name}: calling {model} (attempt {attempt}/{MAX_API_ATTEMPTS}, model {model_index}/{len(models)}).",
                     )
-                    return client.models.generate_content(
-                        model=model,
-                        contents=contents,
-                        config=self._build_generation_config(schema_hint, temperature),
-                    )
+                    kwargs = {
+                        "model": model,
+                        "messages": self._contents_to_messages(contents),
+                        "temperature": temperature,
+                    }
+                    response_format = self._build_response_format(schema_hint)
+                    if response_format:
+                        kwargs["response_format"] = response_format
+                    response = client.chat.completions.create(**kwargs)
+                    return response
                 except Exception as error:
                     last_error = error
                     if self._is_high_demand_error(error):
@@ -347,7 +331,7 @@ class LLMPipeline:
                     self._log(on_log, f"{stage_name}: {model} failed ({error}).")
                     break
 
-        raise last_error if last_error else RuntimeError(f"{stage_name}: all Gemini models failed.")
+        raise last_error if last_error else RuntimeError(f"{stage_name}: all models failed.")
 
     def _stream_text_with_retries(self, stage_name: str, contents, schema_hint: Optional[dict], temperature: float, on_log=None):
         prompt_tokens = self._estimate_input_tokens(contents)
@@ -364,13 +348,21 @@ class LLMPipeline:
                         on_log,
                         f"{stage_name}: calling {model} (attempt {attempt}/{MAX_API_ATTEMPTS}, model {model_index}/{len(models)}).",
                     )
-                    response_stream = client.models.generate_content_stream(
-                        model=model,
-                        contents=contents,
-                        config=self._build_generation_config(schema_hint, temperature),
-                    )
+                    kwargs = {
+                        "model": model,
+                        "messages": self._contents_to_messages(contents),
+                        "temperature": temperature,
+                        "stream": True,
+                    }
+                    response_format = self._build_response_format(schema_hint)
+                    if response_format:
+                        kwargs["response_format"] = response_format
+                    response_stream = client.chat.completions.create(**kwargs)
                     for chunk in response_stream:
-                        text = chunk.text or ""
+                        if not chunk.choices:
+                            continue
+                        delta = chunk.choices[0].delta
+                        text = delta.content if delta and delta.content else ""
                         if not text:
                             continue
                         emitted_any = True
@@ -412,7 +404,7 @@ class LLMPipeline:
                     self._log(on_log, f"{stage_name}: {model} failed ({error}).")
                     break
 
-        raise last_error if last_error else RuntimeError(f"{stage_name}: all Gemini models failed.")
+        raise last_error if last_error else RuntimeError(f"{stage_name}: all models failed.")
 
     def _strip_markdown_fences(self, text: str) -> str:
         cleaned = (text or "").strip()
@@ -481,6 +473,17 @@ class LLMPipeline:
         raw_data = self._parse_json_text(raw_text)
         if isinstance(raw_data, list):
             return [pydantic_model(**item) for item in raw_data]
+        if isinstance(raw_data, dict):
+            # Try parsing the dict directly first (e.g. Agent2Response).
+            try:
+                return pydantic_model(**raw_data)
+            except Exception:
+                pass
+            # Free models often wrap arrays in an object like {"rules": [...]}.
+            # Unwrap by finding the first list value in the dict.
+            for value in raw_data.values():
+                if isinstance(value, list):
+                    return [pydantic_model(**item) for item in value]
         return pydantic_model(**raw_data)
 
     def _repair_json(self, raw_text: str, schema_hint: str, stage_name: str, on_log=None) -> str:
@@ -497,7 +500,7 @@ class LLMPipeline:
             temperature=0,
             on_log=on_log,
         )
-        return response.text or ""
+        return response.choices[0].message.content or ""
 
     def _parse_with_repair(self, raw_text: str, pydantic_model, schema_hint: str, stage_name: str, on_log=None):
         try:
@@ -563,6 +566,9 @@ class LLMPipeline:
                 stage_name=stage_name,
                 on_log=on_log,
             )
+            # Free models may return a single object instead of an array.
+            if stage_name == "Agent 1" and not isinstance(parsed, list):
+                parsed = [parsed]
             if cache_key:
                 self._cache[cache_key] = parsed
             self._log(on_log, f"{stage_name}: parsed response successfully.")
@@ -579,27 +585,17 @@ class LLMPipeline:
         Agent 1 (Policy Interpreter) Generator:
         Yields string tokens of the raw JSON stream from the LLM.
         When finished, yields a tuple ("DONE", List[Agent1Rule]).
+        Note: PDF bytes are ignored — text extraction (PyPDF2) is always used.
         """
-        using_pdf = policy_pdf_bytes is not None
-        if using_pdf:
-            self._log(on_log, "Agent 1: using Gemini native PDF understanding on the uploaded document.")
-            policy_source = "[Use the attached PDF document as the authoritative policy source.]"
-        else:
-            self._log(
-                on_log,
-                f"Agent 1: sending full policy context ({len(policy_text):,} characters, no pruning).",
-            )
-            policy_source = policy_text
+        self._log(
+            on_log,
+            f"Agent 1: sending full policy context ({len(policy_text):,} characters, no pruning).",
+        )
 
-        prompt = prompts.AGENT_1_PROMPT.format(policy_text=policy_source)
-        contents = [prompt]
-        if using_pdf:
-            contents.append(types.Part.from_bytes(data=policy_pdf_bytes, mime_type="application/pdf"))
-
-        cache_material = policy_text if not using_pdf else f"{policy_text}|{hashlib_sha256(policy_pdf_bytes.hex())}"
-        cache_key = self._cache_key("agent_1", cache_material)
+        prompt = prompts.AGENT_1_PROMPT.format(policy_text=policy_text)
+        cache_key = self._cache_key("agent_1", policy_text)
         yield from self._generate_and_parse_json(
-            contents,
+            prompt,
             prompt,
             Agent1Rule,
             stage_name="Agent 1",
@@ -652,7 +648,7 @@ class LLMPipeline:
 
                     schema_hint = json.dumps(Agent2Response.model_json_schema(), separators=(",", ":"))
                     parsed = self._parse_with_repair(
-                        response.text or "",
+                        response.choices[0].message.content or "",
                         Agent2Response,
                         schema_hint=schema_hint,
                         stage_name=f"Agent 2 chunk {chunk_index}/{len(chunks)}",
